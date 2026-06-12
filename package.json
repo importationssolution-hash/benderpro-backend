@@ -1,1 +1,181 @@
+const express = require('express');
+const cors = require('cors');
+const ccxt = require('ccxt');
+const cron = require('node-cron');
 
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ── STOCKAGE EN MÉMOIRE ──
+const users = {}; // { email: { apiKey, secret, exchange, active } }
+const trades = {}; // { email: [ {type, symbol, price, time} ] }
+
+// ── ROUTE TEST ──
+app.get('/', (req, res) => {
+  res.json({ status: 'Bender Pro Backend actif 🤖', users: Object.keys(users).length });
+});
+
+// ── CONNEXION PLATEFORME ──
+app.post('/connect', async (req, res) => {
+  const { email, apiKey, secret, exchangeName } = req.body;
+  if (!email || !apiKey || !secret || !exchangeName) {
+    return res.json({ success: false, error: 'Données manquantes' });
+  }
+  try {
+    const ExchangeClass = ccxt[exchangeName.toLowerCase()];
+    if (!ExchangeClass) return res.json({ success: false, error: 'Plateforme non supportée' });
+
+    const exchange = new ExchangeClass({
+      apiKey: apiKey,
+      secret: secret,
+      enableRateLimit: true,
+      sandbox: false
+    });
+
+    // Test connexion
+    await exchange.loadMarkets();
+    const balance = await exchange.fetchBalance();
+    const usdt = balance.USDT?.free || 0;
+
+    users[email] = { apiKey, secret, exchangeName: exchangeName.toLowerCase(), active: true };
+    if (!trades[email]) trades[email] = [];
+
+    res.json({ success: true, balance: usdt, message: 'Connecté avec succès !' });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// ── STATUT UTILISATEUR ──
+app.get('/status/:email', (req, res) => {
+  const user = users[req.params.email];
+  if (!user) return res.json({ connected: false });
+  res.json({ connected: true, active: user.active, exchange: user.exchangeName });
+});
+
+// ── HISTORIQUE DES TRADES ──
+app.get('/trades/:email', (req, res) => {
+  const history = trades[req.params.email] || [];
+  res.json({ trades: history });
+});
+
+// ── ACTIVER / DÉSACTIVER LE BOT ──
+app.post('/toggle', (req, res) => {
+  const { email, active } = req.body;
+  if (!users[email]) return res.json({ success: false, error: 'Utilisateur non connecté' });
+  users[email].active = active;
+  res.json({ success: true, active: active });
+});
+
+// ── ALGORITHME ──
+function calcRSI(prices, period = 14) {
+  if (prices.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = prices.length - period; i < prices.length; i++) {
+    const diff = prices[i] - prices[i - 1];
+    if (diff > 0) gains += diff;
+    else losses -= diff;
+  }
+  const rs = (gains / period) / ((losses / period) || 0.001);
+  return 100 - (100 / (1 + rs));
+}
+
+function calcEMA(prices, period) {
+  if (prices.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = prices.slice(0, period).reduce((a, b) => a + b) / period;
+  for (let i = period; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
+  return ema;
+}
+
+function getSignal(prices) {
+  const rsi = calcRSI(prices);
+  const ema50 = calcEMA(prices, 50);
+  const price = prices[prices.length - 1];
+  let score = 0;
+
+  if (rsi && rsi < 35) score += 2;
+  if (rsi && rsi > 65) score -= 2;
+  if (ema50 && price > ema50) score += 1;
+  if (ema50 && price < ema50) score -= 1;
+
+  if (score >= 2) return 'BUY';
+  if (score <= -2) return 'SELL';
+  return 'WAIT';
+}
+
+// ── MOTEUR DE TRADING ──
+async function runBot(email, user) {
+  try {
+    const ExchangeClass = ccxt[user.exchangeName];
+    const exchange = new ExchangeClass({
+      apiKey: user.apiKey,
+      secret: user.secret,
+      enableRateLimit: true
+    });
+
+    const symbol = 'BTC/USDT';
+    const ohlcv = await exchange.fetchOHLCV(symbol, '1h', undefined, 100);
+    const prices = ohlcv.map(c => c[4]); // close prices
+    const signal = getSignal(prices);
+    const price = prices[prices.length - 1];
+
+    if (signal === 'BUY') {
+      const balance = await exchange.fetchBalance();
+      const usdt = balance.USDT?.free || 0;
+
+      if (usdt > 10) {
+        const amount = (usdt * 0.95) / price; // 95% du capital
+        const commission = usdt * 0.001; // 0.1% commission Bender Pro
+
+        // Enregistrer le trade
+        trades[email].push({
+          type: 'BUY',
+          symbol,
+          price: price.toFixed(2),
+          amount: amount.toFixed(6),
+          commission: commission.toFixed(4),
+          time: new Date().toISOString()
+        });
+
+        console.log(`[${email}] BUY ${symbol} @ $${price.toFixed(2)} | Commission: $${commission.toFixed(4)}`);
+      }
+    } else if (signal === 'SELL') {
+      const balance = await exchange.fetchBalance();
+      const btc = balance.BTC?.free || 0;
+
+      if (btc > 0.0001) {
+        const value = btc * price;
+        const commission = value * 0.001;
+
+        trades[email].push({
+          type: 'SELL',
+          symbol,
+          price: price.toFixed(2),
+          amount: btc.toFixed(6),
+          commission: commission.toFixed(4),
+          time: new Date().toISOString()
+        });
+
+        console.log(`[${email}] SELL ${symbol} @ $${price.toFixed(2)} | Commission: $${commission.toFixed(4)}`);
+      }
+    }
+  } catch (err) {
+    console.error(`[${email}] Erreur bot:`, err.message);
+  }
+}
+
+// ── CRON : toutes les 30 minutes ──
+cron.schedule('*/30 * * * *', async () => {
+  console.log('🤖 Cycle de trading...');
+  for (const [email, user] of Object.entries(users)) {
+    if (user.active) await runBot(email, user);
+  }
+});
+
+// ── DÉMARRAGE ──
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Bender Pro Backend démarré sur port ${PORT}`);
+});
