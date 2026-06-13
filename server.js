@@ -1,12 +1,52 @@
 const express = require('express');
 const cors = require('cors');
+const mongoose = require('mongoose');
+
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const users = {};
-const trades = {};
+// â”€â”€ CONNEXION MONGODB â”€â”€
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('MongoDB connecte !'))
+  .catch(err => console.log('Erreur MongoDB:', err.message));
 
+// â”€â”€ MODÃˆLES â”€â”€
+const UserSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true },
+  password: String,
+  exchangeName: String,
+  apiKey: String,
+  apiSecret: String,
+  active: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const TradeSchema = new mongoose.Schema({
+  email: String,
+  type: String,
+  symbol: String,
+  price: String,
+  amount: String,
+  confidence: Number,
+  commission: String,
+  exchange: String,
+  time: { type: Date, default: Date.now }
+});
+
+const CommissionSchema = new mongoose.Schema({
+  email: String,
+  amount: Number,
+  symbol: String,
+  tradeValue: Number,
+  time: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model('User', UserSchema);
+const Trade = mongoose.model('Trade', TradeSchema);
+const Commission = mongoose.model('Commission', CommissionSchema);
+
+// â”€â”€ ALGORITHME â”€â”€
 function calcRSI(prices) {
   if (prices.length < 15) return 50;
   let g = 0, l = 0;
@@ -60,54 +100,116 @@ function analyzeMarket() {
   return results;
 }
 
-app.get('/', (req, res) => res.json({ status:'Bender Pro Backend actif', users:Object.keys(users).length }));
+// â”€â”€ ROUTES â”€â”€
+app.get('/', (req, res) => res.json({ status:'Bender Pro Backend actif avec MongoDB', version:'3.0' }));
 
 app.get('/market', (req, res) => res.json({ success:true, data:analyzeMarket() }));
 
-app.post('/connect', (req, res) => {
+// Inscription
+app.post('/register', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.json({ success:false, error:'Email et mot de passe requis' });
+  try {
+    const existing = await User.findOne({ email });
+    if (existing) return res.json({ success:false, error:'Email deja utilise' });
+    const user = new User({ email, password });
+    await user.save();
+    console.log('Nouvel utilisateur:', email);
+    res.json({ success:true, message:'Compte cree !' });
+  } catch(e) {
+    res.json({ success:false, error:e.message });
+  }
+});
+
+// Connexion plateforme
+app.post('/connect', async (req, res) => {
   const { email, apiKey, secret, exchangeName } = req.body;
   if (!email || !apiKey || !secret || !exchangeName)
     return res.json({ success:false, error:'Donnees manquantes' });
-  users[email] = { apiKey, secret, exchangeName, active:true, connectedAt:new Date().toISOString() };
-  if (!trades[email]) trades[email] = [];
-  console.log('Connecte:', email, 'sur', exchangeName);
-  res.json({ success:true, message:'Connecte sur ' + exchangeName });
+  try {
+    await User.findOneAndUpdate(
+      { email },
+      { apiKey, apiSecret:secret, exchangeName, active:true },
+      { upsert:true, new:true }
+    );
+    console.log('Plateforme connectee:', email, '-', exchangeName);
+    res.json({ success:true, message:'Connecte sur ' + exchangeName + ' ! Bot actif.' });
+  } catch(e) {
+    res.json({ success:false, error:e.message });
+  }
 });
 
-app.get('/status/:email', (req, res) => {
-  const u = users[req.params.email];
-  if (!u) return res.json({ connected:false });
-  res.json({ connected:true, active:u.active, exchange:u.exchangeName, connectedAt:u.connectedAt });
+// Statut
+app.get('/status/:email', async (req, res) => {
+  const user = await User.findOne({ email:req.params.email });
+  if (!user) return res.json({ connected:false });
+  res.json({ connected:true, active:user.active, exchange:user.exchangeName, createdAt:user.createdAt });
 });
 
-app.get('/trades/:email', (req, res) => res.json({ trades: trades[req.params.email] || [] }));
+// Historique trades
+app.get('/trades/:email', async (req, res) => {
+  const trades = await Trade.find({ email:req.params.email }).sort({ time:-1 }).limit(50);
+  res.json({ trades });
+});
 
-app.post('/toggle', (req, res) => {
+// Commissions totales
+app.get('/commissions/:email', async (req, res) => {
+  const comms = await Commission.find({ email:req.params.email });
+  const total = comms.reduce((a,c) => a + c.amount, 0);
+  res.json({ total:total.toFixed(4), count:comms.length, commissions:comms });
+});
+
+// Stats admin
+app.get('/admin/stats', async (req, res) => {
+  const users = await User.countDocuments();
+  const trades = await Trade.countDocuments();
+  const comms = await Commission.find();
+  const totalComm = comms.reduce((a,c) => a + c.amount, 0);
+  res.json({ users, trades, totalCommissions:totalComm.toFixed(4) });
+});
+
+// Activer/Desactiver
+app.post('/toggle', async (req, res) => {
   const { email, active } = req.body;
-  if (!users[email]) return res.json({ success:false, error:'Non connecte' });
-  users[email].active = active;
+  await User.findOneAndUpdate({ email }, { active });
   res.json({ success:true, active });
 });
 
-setInterval(() => {
-  const active = Object.entries(users).filter(([,u]) => u.active);
-  if (active.length === 0) return;
-  console.log('Cycle trading -', active.length, 'utilisateurs actifs');
-  const market = analyzeMarket();
-  active.forEach(([email, user]) => {
-    Object.entries(market).forEach(([symbol, data]) => {
-      if (data.signal !== 'WAIT' && data.confidence > 65) {
-        trades[email].push({
-          type:data.signal, symbol, price:data.price,
-          confidence:data.confidence, exchange:user.exchangeName,
-          commission:(parseFloat(data.price)*0.001).toFixed(4),
-          time:new Date().toISOString()
-        });
-        console.log('['+email+']', data.signal, symbol, '@$'+data.price);
+// â”€â”€ CRON : toutes les 30 minutes â”€â”€
+setInterval(async () => {
+  try {
+    const activeUsers = await User.find({ active:true, apiKey:{ $exists:true } });
+    if (activeUsers.length === 0) return;
+    console.log('Cycle trading -', activeUsers.length, 'utilisateurs actifs');
+    const market = analyzeMarket();
+
+    for (const user of activeUsers) {
+      for (const [symbol, data] of Object.entries(market)) {
+        if (data.signal !== 'WAIT' && data.confidence > 65) {
+          const tradeValue = parseFloat(data.price) * 0.001;
+          const commission = tradeValue * 0.001;
+
+          // Sauvegarder le trade
+          await new Trade({
+            email:user.email, type:data.signal, symbol,
+            price:data.price, confidence:data.confidence,
+            commission:commission.toFixed(4), exchange:user.exchangeName
+          }).save();
+
+          // Sauvegarder la commission
+          await new Commission({
+            email:user.email, amount:commission,
+            symbol, tradeValue
+          }).save();
+
+          console.log('['+user.email+']', data.signal, symbol, '| Commission: $'+commission.toFixed(4));
+        }
       }
-    });
-  });
-}, 30*60*1000);
+    }
+  } catch(e) {
+    console.log('Erreur cycle:', e.message);
+  }
+}, 30 * 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Bender Pro Backend demarre port', PORT));
+app.listen(PORT, () => console.log('Bender Pro Backend v3.0 avec MongoDB demarre port', PORT));
