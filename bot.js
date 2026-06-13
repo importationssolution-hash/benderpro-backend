@@ -1,129 +1,182 @@
-ender Pro â€” Moteur de trading automatique
-// Tourne toutes les 30 minutes et analyse le marchÃ©
+const ccxt = require('ccxt');
+const mongoose = require('mongoose');
 
-const https = require('https');
+// ── CONFIG ──
+const COMMISSION_RATE = 0.001; // 0.1%
+const BENDER_WALLET = process.env.BENDER_WALLET;
+const MONGODB_URI = process.env.MONGODB_URI;
+const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
 
-// â”€â”€ CONFIGURATION â”€â”€
-const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT'];
-const COMMISSION = 0.001; // 0.1%
-const CHECK_INTERVAL = 30 * 60 * 1000; // 30 minutes
+// ── MONGODB ──
+const UserSchema = new mongoose.Schema({
+  email: String,
+  exchangeName: String,
+  apiKey: String,
+  apiSecret: String,
+  active: Boolean
+});
 
-// â”€â”€ ALGORITHME RSI â”€â”€
-function calcRSI(prices, period = 14) {
-  if (prices.length < period + 1) return 50;
-  let gains = 0, losses = 0;
-  for (let i = prices.length - period; i < prices.length; i++) {
-    const diff = prices[i] - prices[i - 1];
-    if (diff > 0) gains += diff;
-    else losses -= diff;
+const TradeSchema = new mongoose.Schema({
+  email: String,
+  type: String,
+  symbol: String,
+  price: String,
+  commissionUSD: Number,
+  commissionBTC: Number,
+  walletDestination: String,
+  time: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model('User', UserSchema);
+const Trade = mongoose.model('Trade', TradeSchema);
+
+// ── ALGORITHME ──
+function calcRSI(prices) {
+  if (prices.length < 15) return 50;
+  let g = 0, l = 0;
+  for (let i = prices.length - 14; i < prices.length; i++) {
+    const d = prices[i] - prices[i-1];
+    if (d > 0) g += d; else l -= d;
   }
-  const rs = (gains / period) / ((losses / period) || 0.001);
-  return 100 - (100 / (1 + rs));
+  return 100 - (100 / (1 + (g/14) / ((l/14)||0.001)));
 }
 
-// â”€â”€ ALGORITHME EMA â”€â”€
-function calcEMA(prices, period) {
-  if (prices.length < period) return prices[prices.length - 1];
-  const k = 2 / (period + 1);
-  let ema = prices.slice(0, period).reduce((a, b) => a + b) / period;
-  for (let i = period; i < prices.length; i++) {
-    ema = prices[i] * k + ema * (1 - k);
-  }
-  return ema;
+function calcEMA(prices, n) {
+  if (prices.length < n) return prices[prices.length-1];
+  const k = 2/(n+1);
+  let e = prices.slice(0,n).reduce((a,b)=>a+b)/n;
+  for (let i = n; i < prices.length; i++) e = prices[i]*k+e*(1-k);
+  return e;
 }
 
-// â”€â”€ ALGORITHME BOLLINGER â”€â”€
-function calcBollinger(prices, period = 20) {
-  if (prices.length < period) return null;
-  const slice = prices.slice(-period);
-  const mean = slice.reduce((a, b) => a + b) / period;
-  const variance = slice.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / period;
-  const std = Math.sqrt(variance);
-  return { upper: mean + 2 * std, lower: mean - 2 * std, middle: mean };
-}
-
-// â”€â”€ SIGNAL COMBINÃ‰ (6 stratÃ©gies) â”€â”€
 function getSignal(prices) {
-  const price = prices[prices.length - 1];
   const rsi = calcRSI(prices);
-  const ema20 = calcEMA(prices, 20);
-  const ema50 = calcEMA(prices, 50);
-  const ema200 = calcEMA(prices, Math.min(200, prices.length));
-  const boll = calcBollinger(prices);
+  const e20 = calcEMA(prices, 20);
+  const e50 = calcEMA(prices, 50);
+  const p = prices[prices.length-1];
   let score = 0;
-
-  // RSI
-  if (rsi < 30) score += 2;
+  if (rsi < 30) score += 3;
   else if (rsi < 40) score += 1;
-  else if (rsi > 70) score -= 2;
+  else if (rsi > 70) score -= 3;
   else if (rsi > 60) score -= 1;
+  if (e20 > e50) score += 1; else score -= 1;
+  if (p > e50) score += 1; else score -= 1;
+  const conf = Math.min(92, Math.abs(score)*10+55);
+  if (score >= 3) return { signal:'BUY', confidence:Math.round(conf) };
+  if (score <= -3) return { signal:'SELL', confidence:Math.round(conf) };
+  return { signal:'WAIT', confidence:Math.round(conf) };
+}
 
-  // EMA Cross
-  if (ema20 > ema50) score += 1;
-  else score -= 1;
+// ── TRADING RÉEL ──
+async function tradeUser(user) {
+  try {
+    const ExchangeClass = ccxt[user.exchangeName.toLowerCase()];
+    if (!ExchangeClass) return;
 
-  // Trend (EMA200)
-  if (price > ema200) score += 1;
-  else score -= 1;
+    const exchange = new ExchangeClass({
+      apiKey: user.apiKey,
+      secret: user.apiSecret,
+      enableRateLimit: true
+    });
 
-  // Bollinger
-  if (boll) {
-    if (price <= boll.lower) score += 2;
-    else if (price >= boll.upper) score -= 2;
+    console.log('Trading pour:', user.email, 'sur', user.exchangeName);
+    const balance = await exchange.fetchBalance();
+    const usdt = balance.USDT?.free || 0;
+    const btcPrice = (await exchange.fetchTicker('BTC/USDT')).last;
+
+    console.log('Balance USDT:', usdt, '| BTC Price: $'+btcPrice);
+
+    for (const symbol of SYMBOLS) {
+      try {
+        const ohlcv = await exchange.fetchOHLCV(symbol, '1h', undefined, 100);
+        const prices = ohlcv.map(c => c[4]);
+        const sig = getSignal(prices);
+        const price = prices[prices.length-1];
+
+        console.log(symbol, '-', sig.signal, sig.confidence+'%');
+
+        if (sig.signal === 'BUY' && sig.confidence > 65 && usdt >= 10) {
+          // Calculer commission 0.1%
+          const tradeAmount = usdt * 0.3;
+          const commissionUSD = tradeAmount * COMMISSION_RATE;
+          const commissionBTC = commissionUSD / btcPrice;
+
+          console.log('Commission:', commissionUSD.toFixed(4), 'USD =', commissionBTC.toFixed(8), 'BTC');
+          console.log('Vers wallet:', BENDER_WALLET);
+
+          // Sauvegarder dans MongoDB
+          await new Trade({
+            email: user.email,
+            type: 'BUY',
+            symbol,
+            price: price.toFixed(2),
+            commissionUSD,
+            commissionBTC,
+            walletDestination: BENDER_WALLET
+          }).save();
+
+          console.log('Trade BUY enregistre pour', user.email);
+        }
+
+        if (sig.signal === 'SELL' && sig.confidence > 65) {
+          const base = symbol.split('/')[0];
+          const baseBalance = balance[base]?.free || 0;
+
+          if (baseBalance > 0.0001) {
+            const tradeValue = baseBalance * price;
+            const commissionUSD = tradeValue * COMMISSION_RATE;
+            const commissionBTC = commissionUSD / btcPrice;
+
+            await new Trade({
+              email: user.email,
+              type: 'SELL',
+              symbol,
+              price: price.toFixed(2),
+              commissionUSD,
+              commissionBTC,
+              walletDestination: BENDER_WALLET
+            }).save();
+
+            console.log('Trade SELL enregistre pour', user.email);
+          }
+        }
+
+      } catch(e) {
+        console.log('Erreur', symbol+':', e.message);
+      }
+    }
+
+  } catch(e) {
+    console.log('Erreur utilisateur', user.email+':', e.message);
+  }
+}
+
+// ── MAIN ──
+async function main() {
+  console.log('=== Bender Pro Bot - Cycle de trading ===');
+  console.log('Heure:', new Date().toISOString());
+  console.log('Wallet BTC:', BENDER_WALLET);
+
+  if (!MONGODB_URI) {
+    console.log('MONGODB_URI manquant !');
+    return;
   }
 
-  // Momentum
-  const recent = prices.slice(-5);
-  const momentum = (recent[recent.length-1] - recent[0]) / recent[0] * 100;
-  if (momentum > 1) score += 1;
-  else if (momentum < -1) score -= 1;
+  await mongoose.connect(MONGODB_URI);
+  console.log('MongoDB connecte !');
 
-  // Volume simulation
-  const volatility = Math.abs(prices[prices.length-1] - prices[prices.length-2]) / prices[prices.length-2];
-  if (volatility < 0.02) score += 0.5;
+  const users = await User.find({ active: true, apiKey: { $exists: true } });
+  console.log('Utilisateurs actifs:', users.length);
 
-  const confidence = Math.min(95, Math.abs(score) * 12 + 50);
-
-  if (score >= 3) return { signal: 'BUY', confidence: Math.round(confidence), rsi: Math.round(rsi) };
-  if (score <= -3) return { signal: 'SELL', confidence: Math.round(confidence), rsi: Math.round(rsi) };
-  return { signal: 'WAIT', confidence: Math.round(confidence), rsi: Math.round(rsi) };
-}
-
-// â”€â”€ PRIX SIMULÃ‰S (remplacer par vraie API quand backend prÃªt) â”€â”€
-function generatePrices(base, count = 100) {
-  const prices = [base];
-  for (let i = 1; i < count; i++) {
-    prices.push(+(prices[i-1] * (1 + (Math.random() - 0.48) * 0.018)).toFixed(2));
+  for (const user of users) {
+    await tradeUser(user);
   }
-  return prices;
+
+  console.log('=== Cycle termine ===');
+  process.exit(0);
 }
 
-// â”€â”€ ANALYSE MARCHÃ‰ â”€â”€
-function analyzeMarket() {
-  const bases = { 'BTC/USDT': 65000, 'ETH/USDT': 3400, 'SOL/USDT': 145, 'BNB/USDT': 580 };
-  const results = {};
-
-  SYMBOLS.forEach(symbol => {
-    const prices = generatePrices(bases[symbol]);
-    const analysis = getSignal(prices);
-    const price = prices[prices.length - 1];
-    results[symbol] = {
-      price: price.toFixed(2),
-      signal: analysis.signal,
-      confidence: analysis.confidence,
-      rsi: analysis.rsi,
-      commission: (price * COMMISSION).toFixed(4),
-      time: new Date().toISOString()
-    };
-  });
-
-  return results;
-}
-
-// â”€â”€ EXPORT POUR SERVER.JS â”€â”€
-module.exports = { analyzeMarket, getSignal, COMMISSION };
-
-// â”€â”€ LOG DÃ‰MARRAGE â”€â”€
-console.log('Bot Bender Pro initialisÃ© â€” 6 stratÃ©gies actives');
-console.log('Symboles:', SYMBOLS.join(', '));
-console.log('Commission:', (COMMISSION * 100) + '%');
+main().catch(err => {
+  console.error('Erreur fatale:', err.message);
+  process.exit(1);
+});
