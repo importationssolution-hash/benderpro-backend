@@ -90,16 +90,19 @@ const FIGURES = [
 
 // EXCHANGES
 const EXCHANGES_CONFIG = [
-  { id:'kraken',   name:'Kraken',   spot:true, futures:true  },
-  { id:'binance',  name:'Binance',  spot:true, futures:true  },
-  { id:'bybit',    name:'Bybit',    spot:true, futures:true  },
-  { id:'bitget',   name:'Bitget',   spot:true, futures:true  },
-  { id:'okx',      name:'OKX',      spot:true, futures:true  },
-  { id:'kucoin',   name:'KuCoin',   spot:true, futures:true  },
-  { id:'gateio',   name:'Gate.io',  spot:true, futures:true  },
-  { id:'mexc',     name:'MEXC',     spot:true, futures:true  },
-  { id:'bingx',    name:'BingX',    spot:true, futures:true  },
-  { id:'phemex',   name:'Phemex',   spot:true, futures:true  },
+  { id:'kraken',      name:'Kraken',   spot:true,  futures:true  },
+  { id:'binance',     name:'Binance',  spot:true,  futures:true  },
+  { id:'bybit',       name:'Bybit',    spot:true,  futures:true  },
+  { id:'bitget',      name:'Bitget',   spot:true,  futures:true  },
+  { id:'okx',         name:'OKX',      spot:true,  futures:true  },
+  { id:'kucoin',      name:'KuCoin',   spot:true,  futures:true  },
+  { id:'gateio',      name:'Gate.io',  spot:true,  futures:true  },
+  { id:'mexc',        name:'MEXC',     spot:true,  futures:true  },
+  { id:'bingx',       name:'BingX',    spot:true,  futures:true  },
+  { id:'phemex',      name:'Phemex',   spot:true,  futures:true  },
+  { id:'coinbasepro', name:'Coinbase', spot:true,  futures:false },
+  { id:'bitfinex',    name:'Bitfinex', spot:true,  futures:false },
+  { id:'bitstamp',    name:'Bitstamp', spot:true,  futures:false },
 ];
 
 const signalsCache = [];
@@ -240,22 +243,49 @@ async function scanExchange(exConfig) {
 }
 
 async function scanAll() {
-  console.log(`\n=== SCAN 1m â€” ${new Date().toLocaleTimeString()} ===`);
+  console.log(`\n=== SCAN 1m — ${new Date().toLocaleTimeString()} ===`);
   signalsCache.length = 0;
 
-  for (let i=0; i<EXCHANGES_CONFIG.length; i+=3) {
-    const chunk = EXCHANGES_CONFIG.slice(i, i+3);
-    const results = await Promise.all(chunk.map(ex => scanExchange(ex)));
-    results.forEach(r => signalsCache.push(...r));
-    await new Promise(r => setTimeout(r, 2000));
+  // Scanner SEULEMENT les plateformes des utilisateurs actifs
+  const users = await User.find({ active:true, apiKey:{$exists:true} });
+
+  if (users.length === 0) {
+    // Pas d'utilisateur connecte — scan Kraken par defaut pour les tests
+    console.log('Aucun utilisateur — scan Kraken par defaut (mode test)');
+    const krakenConfig = EXCHANGES_CONFIG.find(e => e.id === 'kraken');
+    if (krakenConfig) {
+      const results = await scanExchange(krakenConfig);
+      signalsCache.push(...results);
+    }
+    lastScanTime = new Date();
+    console.log(`=== FIN test · ${signalsCache.length} signaux ===\n`);
+    return;
+  }
+
+  // Trouver les plateformes uniques des utilisateurs
+  const uniqueExchanges = [...new Set(users.map(u => u.exchangeName.toLowerCase()))];
+  console.log(`Utilisateurs: ${users.length} · Plateformes: ${uniqueExchanges.join(', ')}`);
+
+  // Scanner seulement ces plateformes
+  for (const exchangeId of uniqueExchanges) {
+    const exConfig = EXCHANGES_CONFIG.find(e => e.id === exchangeId || e.name.toLowerCase() === exchangeId);
+    if (!exConfig) continue;
+    const results = await scanExchange(exConfig);
+    signalsCache.push(...results);
   }
 
   lastScanTime = new Date();
-  console.log(`=== FIN Â· ${signalsCache.length} signaux ===\n`);
+  console.log(`=== FIN · ${signalsCache.length} signaux ===\n`);
 
-  const users = await User.find({ active:true, apiKey:{$exists:true} });
+  // Executer trades pour chaque utilisateur sur SA plateforme
   for (const user of users) {
-    for (const sig of signalsCache.slice(0, 5)) {
+    const userExchangeName = user.exchangeName.toLowerCase();
+    const userSignals = signalsCache.filter(s =>
+      s.exchange.toLowerCase() === userExchangeName ||
+      s.exchangeId === userExchangeName
+    );
+
+    for (const sig of userSignals.slice(0, 5)) {
       try {
         const fig = FIGURES.find(f=>f.name===sig.figure) || FIGURES[0];
         const won = Math.random() < fig.wr;
@@ -276,7 +306,7 @@ async function scanAll() {
 // ROUTES
 app.get('/', (req, res) => res.json({
   status:        'Bender Pro v7.0 actif',
-  strategy:      'Figures chartistes + Volume Â· Ratio 1:4 Â· Timeframe 1m',
+  strategy:      'Figures chartistes + Volume · Ratio 1:4 · Timeframe 1m',
   tradeAmount:   TRADE_AMOUNT,
   slPct:         SL_PCT*100+'%',
   tpPct:         TP_PCT*100+'%',
@@ -308,7 +338,7 @@ app.post('/connect', async (req, res) => {
       { apiKey, apiSecret:secret, exchangeName, active:true, tradeAmount:tradeAmount||TRADE_AMOUNT },
       { upsert:true, new:true }
     );
-    res.json({ success:true, message:`Connecte sur ${exchangeName} Â· $${tradeAmount||TRADE_AMOUNT}/trade Â· Ratio 1:4 Â· 1m` });
+    res.json({ success:true, message:`Connecte sur ${exchangeName} · $${tradeAmount||TRADE_AMOUNT}/trade · Ratio 1:4 · 1m` });
   } catch(e) { res.json({ success:false, error:e.message }); }
 });
 
@@ -366,10 +396,10 @@ app.post('/toggle', async (req, res) => {
 // DEMARRAGE
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\n Bender Pro v7.0 Â· Port ${PORT}`);
-  console.log(` Figures chartistes + Volume Â· Ratio 1:4 Â· 1m`);
-  console.log(` Helmet actif Â· Securite HTTP headers`);
-  console.log(` $${TRADE_AMOUNT}/trade Â· SL -1% Â· TP +4%`);
+  console.log(`\n Bender Pro v7.0 · Port ${PORT}`);
+  console.log(` Figures chartistes + Volume · Ratio 1:4 · 1m`);
+  console.log(` Helmet actif · Securite HTTP headers`);
+  console.log(` $${TRADE_AMOUNT}/trade · SL -1% · TP +4%`);
   console.log(` Scan toutes les 60 secondes\n`);
   setTimeout(() => scanAll().catch(console.error), 5000);
 });
