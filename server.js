@@ -1,24 +1,26 @@
 // Bender Pro v7.0
-// npm install express cors mongoose ccxt
+// npm install express cors mongoose ccxt helmet
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const ccxt = require('ccxt');
+const helmet = require('helmet');
 
 const app = express();
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
 app.use(express.json());
 
 // CONFIG
-const BENDER_WALLET = process.env.BENDER_WALLET || 'bc1qa428vssgaue3jer2ezhfy4khv0rwekyhjj5p2d';
-const TRADE_AMOUNT  = 2;
-const SL_PCT        = 0.01;
-const TP_PCT        = 0.04;
-const COMM_RATE     = 0.001;
+const BENDER_WALLET  = process.env.BENDER_WALLET || 'bc1qa428vssgaue3jer2ezhfy4khv0rwekyhjj5p2d';
+const TRADE_AMOUNT   = 2;
+const SL_PCT         = 0.01;
+const TP_PCT         = 0.04;
+const COMM_RATE      = 0.001;
 const MAX_CONCURRENT = 20;
-const VOL_CONFIRM   = 1.8;
-const VOL_EXIT      = 0.55;
-const SCAN_INTERVAL = 60 * 1000;
+const VOL_CONFIRM    = 1.8;
+const VOL_EXIT       = 0.55;
+const SCAN_INTERVAL  = 60 * 1000;
 
 // MONGODB
 mongoose.connect(process.env.MONGODB_URI)
@@ -67,37 +69,37 @@ const SignalSchema = new mongoose.Schema({
   time:        { type: Date, default: Date.now }
 });
 
-const User   = mongoose.model('User', UserSchema);
-const Trade  = mongoose.model('Trade', TradeSchema);
+const User   = mongoose.model('User',   UserSchema);
+const Trade  = mongoose.model('Trade',  TradeSchema);
 const Signal = mongoose.model('Signal', SignalSchema);
 
 // FIGURES CHARTISTES
 const FIGURES = [
-  { name:'Cup & Handle',      code:'C&H',    dir:'Long',  wr:0.84 },
-  { name:'ETE',               code:'ETE',    dir:'Short', wr:0.83 },
-  { name:'ETE Inverse',       code:'ETEi',   dir:'Long',  wr:0.81 },
-  { name:'Double Top',        code:'2Top',   dir:'Short', wr:0.78 },
-  { name:'Double Bottom',     code:'2Bot',   dir:'Long',  wr:0.76 },
-  { name:'Triangle Asc.',     code:'TriA',   dir:'Long',  wr:0.74 },
-  { name:'Triangle Desc.',    code:'TriD',   dir:'Short', wr:0.73 },
-  { name:'Drapeau Haussier',  code:'DrapH',  dir:'Long',  wr:0.76 },
-  { name:'Drapeau Baissier',  code:'DrapB',  dir:'Short', wr:0.75 },
-  { name:'Biseau Haussier',   code:'BisH',   dir:'Short', wr:0.72 },
-  { name:'Biseau Baissier',   code:'BisB',   dir:'Long',  wr:0.73 },
+  { name:'Cup & Handle',     code:'C&H',   dir:'Long',  wr:0.84 },
+  { name:'ETE',              code:'ETE',   dir:'Short', wr:0.83 },
+  { name:'ETE Inverse',      code:'ETEi',  dir:'Long',  wr:0.81 },
+  { name:'Double Top',       code:'2Top',  dir:'Short', wr:0.78 },
+  { name:'Double Bottom',    code:'2Bot',  dir:'Long',  wr:0.76 },
+  { name:'Triangle Asc.',    code:'TriA',  dir:'Long',  wr:0.74 },
+  { name:'Triangle Desc.',   code:'TriD',  dir:'Short', wr:0.73 },
+  { name:'Drapeau Haussier', code:'DrapH', dir:'Long',  wr:0.76 },
+  { name:'Drapeau Baissier', code:'DrapB', dir:'Short', wr:0.75 },
+  { name:'Biseau Haussier',  code:'BisH',  dir:'Short', wr:0.72 },
+  { name:'Biseau Baissier',  code:'BisB',  dir:'Long',  wr:0.73 },
 ];
 
 // EXCHANGES
 const EXCHANGES_CONFIG = [
-  { id:'kraken',   name:'Kraken',   spot:true,  futures:true  },
-  { id:'binance',  name:'Binance',  spot:true,  futures:true  },
-  { id:'bybit',    name:'Bybit',    spot:true,  futures:true  },
-  { id:'bitget',   name:'Bitget',   spot:true,  futures:true  },
-  { id:'okx',      name:'OKX',      spot:true,  futures:true  },
-  { id:'kucoin',   name:'KuCoin',   spot:true,  futures:true  },
-  { id:'gateio',   name:'Gate.io',  spot:true,  futures:true  },
-  { id:'mexc',     name:'MEXC',     spot:true,  futures:true  },
-  { id:'bingx',    name:'BingX',    spot:true,  futures:true  },
-  { id:'phemex',   name:'Phemex',   spot:true,  futures:true  },
+  { id:'kraken',   name:'Kraken',   spot:true, futures:true  },
+  { id:'binance',  name:'Binance',  spot:true, futures:true  },
+  { id:'bybit',    name:'Bybit',    spot:true, futures:true  },
+  { id:'bitget',   name:'Bitget',   spot:true, futures:true  },
+  { id:'okx',      name:'OKX',      spot:true, futures:true  },
+  { id:'kucoin',   name:'KuCoin',   spot:true, futures:true  },
+  { id:'gateio',   name:'Gate.io',  spot:true, futures:true  },
+  { id:'mexc',     name:'MEXC',     spot:true, futures:true  },
+  { id:'bingx',    name:'BingX',    spot:true, futures:true  },
+  { id:'phemex',   name:'Phemex',   spot:true, futures:true  },
 ];
 
 const signalsCache = [];
@@ -121,54 +123,43 @@ function detectFigure(closes, volumes) {
   const range = figH / price;
   const trend10 = (price - closes[n-11]) / closes[n-11];
 
-  // Cup & Handle
   if (n >= 15) {
     const midLow = Math.min(...closes.slice(n-12, n-4));
     if (midLow < closes[n-14]*0.95 && price > closes[n-2] && volRatio > 1.8)
       return { fig:FIGURES[0], tp:price+figH, sl:price*(1-SL_PCT) };
   }
-  // ETE
   if (n >= 15) {
     const head = Math.max(...closes.slice(n-12, n-4));
     const sh = Math.max(...closes.slice(n-14, n-10));
     if (head>sh*1.02 && head>closes[n-2]*1.02 && price<sh && volRatio>1.5)
       return { fig:FIGURES[1], tp:price-figH*0.85, sl:price*(1+SL_PCT) };
   }
-  // ETE Inverse
   if (n >= 15) {
     const headL = Math.min(...closes.slice(n-12, n-4));
     const shL = Math.min(...closes.slice(n-14, n-10));
     if (headL<shL*0.98 && headL<closes[n-2]*0.98 && price>shL && volRatio>1.5)
       return { fig:FIGURES[2], tp:price+figH*0.85, sl:price*(1-SL_PCT) };
   }
-  // Double Top
   if (n >= 10) {
     const mx1=Math.max(...closes.slice(n-10,n-5)), mx2=Math.max(...closes.slice(n-5,n));
     if (Math.abs(mx1-mx2)/mx1<0.015 && price<Math.min(...closes.slice(n-5,n))*0.99 && volRatio>1.4)
       return { fig:FIGURES[3], tp:price-figH*0.9, sl:price*(1+SL_PCT) };
   }
-  // Double Bottom
   if (n >= 10) {
     const mn1=Math.min(...closes.slice(n-10,n-5)), mn2=Math.min(...closes.slice(n-5,n));
     if (Math.abs(mn1-mn2)/mn1<0.015 && price>Math.max(...closes.slice(n-5,n))*1.01 && volRatio>1.4)
       return { fig:FIGURES[4], tp:price+figH*0.9, sl:price*(1-SL_PCT) };
   }
-  // Triangle Asc.
   if (range<0.04 && trend10>0.01 && price>=h*0.998 && volRatio>1.6)
     return { fig:FIGURES[5], tp:price+figH*0.8, sl:price*(1-SL_PCT) };
-  // Triangle Desc.
   if (range<0.04 && trend10<-0.01 && price<=l*1.002 && volRatio>1.6)
     return { fig:FIGURES[6], tp:price-figH*0.8, sl:price*(1+SL_PCT) };
-  // Drapeau Haussier
   if (trend10>0.06 && range<0.025 && volRatio>1.8)
     return { fig:FIGURES[7], tp:price+figH, sl:price*(1-SL_PCT) };
-  // Drapeau Baissier
   if (trend10<-0.06 && range<0.025 && volRatio>1.8)
     return { fig:FIGURES[8], tp:price-figH, sl:price*(1+SL_PCT) };
-  // Biseau Haussier
   if (range<0.035 && trend10>0.02 && trend10<0.05 && volRatio>1.7)
     return { fig:FIGURES[9], tp:price-figH*0.75, sl:price*(1+SL_PCT) };
-  // Biseau Baissier
   if (range<0.035 && trend10<-0.02 && trend10>-0.05 && volRatio>1.7)
     return { fig:FIGURES[10], tp:price+figH*0.75, sl:price*(1-SL_PCT) };
 
@@ -211,17 +202,24 @@ async function scanExchange(exConfig) {
 
         const volRatio = volumes[volumes.length-1] / avg(volumes.slice(-20));
         const signal = {
-          symbol, exchange: exConfig.name, exchangeId: exConfig.id,
-          timeframe: '1m', market: market === 'spot' ? 'Spot' : 'Futures',
-          figure: sig.fig.name, figureCode: sig.fig.code,
-          direction: sig.fig.dir, confidence: Math.round(sig.fig.wr * 100),
-          entryPrice: price, tp: sig.tp, sl: sig.sl,
+          symbol,
+          exchange:    exConfig.name,
+          exchangeId:  exConfig.id,
+          timeframe:   '1m',
+          market:      market === 'spot' ? 'Spot' : 'Futures',
+          figure:      sig.fig.name,
+          figureCode:  sig.fig.code,
+          direction:   sig.fig.dir,
+          confidence:  Math.round(sig.fig.wr * 100),
+          entryPrice:  price,
+          tp:          sig.tp,
+          sl:          sig.sl,
           volumeRatio: volRatio.toFixed(2),
           tradeAmount: TRADE_AMOUNT,
-          gain: (TRADE_AMOUNT*TP_PCT).toFixed(4),
-          loss: (TRADE_AMOUNT*SL_PCT).toFixed(4),
-          commission: (TRADE_AMOUNT*COMM_RATE).toFixed(4),
-          time: new Date()
+          gain:        (TRADE_AMOUNT*TP_PCT).toFixed(4),
+          loss:        (TRADE_AMOUNT*SL_PCT).toFixed(4),
+          commission:  (TRADE_AMOUNT*COMM_RATE).toFixed(4),
+          time:        new Date()
         };
         results.push(signal);
 
@@ -242,7 +240,7 @@ async function scanExchange(exConfig) {
 }
 
 async function scanAll() {
-  console.log(`\n=== SCAN 1m — ${new Date().toLocaleTimeString()} ===`);
+  console.log(`\n=== SCAN 1m â€” ${new Date().toLocaleTimeString()} ===`);
   signalsCache.length = 0;
 
   for (let i=0; i<EXCHANGES_CONFIG.length; i+=3) {
@@ -253,7 +251,7 @@ async function scanAll() {
   }
 
   lastScanTime = new Date();
-  console.log(`=== FIN · ${signalsCache.length} signaux ===\n`);
+  console.log(`=== FIN Â· ${signalsCache.length} signaux ===\n`);
 
   const users = await User.find({ active:true, apiKey:{$exists:true} });
   for (const user of users) {
@@ -277,15 +275,15 @@ async function scanAll() {
 
 // ROUTES
 app.get('/', (req, res) => res.json({
-  status: 'Bender Pro v7.0 actif',
-  strategy: 'Figures chartistes + Volume · Ratio 1:4 · Timeframe 1m',
-  tradeAmount: TRADE_AMOUNT,
-  slPct: SL_PCT*100+'%',
-  tpPct: TP_PCT*100+'%',
-  exchanges: EXCHANGES_CONFIG.length,
-  lastScan: lastScanTime,
+  status:        'Bender Pro v7.0 actif',
+  strategy:      'Figures chartistes + Volume Â· Ratio 1:4 Â· Timeframe 1m',
+  tradeAmount:   TRADE_AMOUNT,
+  slPct:         SL_PCT*100+'%',
+  tpPct:         TP_PCT*100+'%',
+  exchanges:     EXCHANGES_CONFIG.length,
+  lastScan:      lastScanTime,
   signalsActive: signalsCache.length,
-  wallet: BENDER_WALLET
+  wallet:        BENDER_WALLET
 }));
 
 app.get('/market', (req, res) => {
@@ -310,7 +308,7 @@ app.post('/connect', async (req, res) => {
       { apiKey, apiSecret:secret, exchangeName, active:true, tradeAmount:tradeAmount||TRADE_AMOUNT },
       { upsert:true, new:true }
     );
-    res.json({ success:true, message:`Connecte sur ${exchangeName} · $${tradeAmount||TRADE_AMOUNT}/trade · Ratio 1:4 · 1m` });
+    res.json({ success:true, message:`Connecte sur ${exchangeName} Â· $${tradeAmount||TRADE_AMOUNT}/trade Â· Ratio 1:4 Â· 1m` });
   } catch(e) { res.json({ success:false, error:e.message }); }
 });
 
@@ -319,8 +317,11 @@ app.get('/status/:email', async (req, res) => {
   if (!user) return res.json({ connected:false });
   const trades = await Trade.countDocuments({ email:req.params.email });
   const wins   = await Trade.countDocuments({ email:req.params.email, result:'WIN' });
-  res.json({ connected:true, active:user.active, exchange:user.exchangeName,
-    tradeAmount:user.tradeAmount, trades, winRate:trades>0?Math.round(wins/trades*100)+'%':'N/A' });
+  res.json({
+    connected:true, active:user.active, exchange:user.exchangeName,
+    tradeAmount:user.tradeAmount, trades,
+    winRate:trades>0?Math.round(wins/trades*100)+'%':'N/A'
+  });
 });
 
 app.get('/trades/:email', async (req, res) => {
@@ -345,10 +346,15 @@ app.get('/admin/stats', async (req, res) => {
   const trades = await Trade.countDocuments();
   const wins   = await Trade.countDocuments({ result:'WIN' });
   const comms  = await Trade.aggregate([{$group:{_id:null,total:{$sum:'$commission'}}}]);
-  res.json({ users, active, trades, winRate:trades>0?Math.round(wins/trades*100)+'%':'N/A',
-    totalCommissions:(comms[0]?.total||0).toFixed(4),
-    signalsActive:signalsCache.length, lastScan:lastScanTime,
-    exchanges:EXCHANGES_CONFIG.length, wallet:BENDER_WALLET });
+  res.json({
+    users, active, trades,
+    winRate:      trades>0?Math.round(wins/trades*100)+'%':'N/A',
+    totalComm:    (comms[0]?.total||0).toFixed(4),
+    signalsActive:signalsCache.length,
+    lastScan:     lastScanTime,
+    exchanges:    EXCHANGES_CONFIG.length,
+    wallet:       BENDER_WALLET
+  });
 });
 
 app.post('/toggle', async (req, res) => {
@@ -357,11 +363,13 @@ app.post('/toggle', async (req, res) => {
   res.json({ success:true, active });
 });
 
+// DEMARRAGE
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\n Bender Pro v7.0 · Port ${PORT}`);
-  console.log(` Figures chartistes + Volume · Ratio 1:4 · 1m`);
-  console.log(` $${TRADE_AMOUNT}/trade · SL -1% · TP +4%`);
+  console.log(`\n Bender Pro v7.0 Â· Port ${PORT}`);
+  console.log(` Figures chartistes + Volume Â· Ratio 1:4 Â· 1m`);
+  console.log(` Helmet actif Â· Securite HTTP headers`);
+  console.log(` $${TRADE_AMOUNT}/trade Â· SL -1% Â· TP +4%`);
   console.log(` Scan toutes les 60 secondes\n`);
   setTimeout(() => scanAll().catch(console.error), 5000);
 });
