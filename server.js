@@ -323,7 +323,7 @@ app.get('/market', (req, res) => {
   res.json({ success:true, signals:sigs, count:sigs.length, lastScan:lastScanTime });
 });
 
-app.post('/scan', async (req, res) => {
+app.get('/scan', async (req, res) => {
   res.json({ success:true, message:'Scan lance...' });
   scanAll().catch(console.error);
 });
