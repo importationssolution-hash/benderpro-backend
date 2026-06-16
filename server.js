@@ -1,10 +1,11 @@
-// Bender Pro v7.0
-// npm install express cors mongoose ccxt helmet
+// Bender Pro v8.0 — Scan via WebSocket Kraken (quasi instantane)
+// npm install express cors mongoose ccxt helmet ws
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const ccxt = require('ccxt');
 const helmet = require('helmet');
+const WebSocket = require('ws');
 
 const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
@@ -19,8 +20,8 @@ const TP_PCT         = 0.04;
 const COMM_RATE      = 0.001;
 const MAX_CONCURRENT = 20;
 const VOL_CONFIRM    = 1.8;
-const VOL_EXIT       = 0.55;
 const SCAN_INTERVAL  = 60 * 1000;
+const MAX_PAIRS      = 500;
 
 // MONGODB
 mongoose.connect(process.env.MONGODB_URI)
@@ -88,7 +89,7 @@ const FIGURES = [
   { name:'Biseau Baissier',  code:'BisB',  dir:'Long',  wr:0.73 },
 ];
 
-// EXCHANGES
+// EXCHANGES (affichage seulement — le scan WebSocket rapide ne couvre que Kraken pour l'instant)
 const EXCHANGES_CONFIG = [
   { id:'kraken',      name:'Kraken',   spot:true,  futures:true  },
   { id:'binance',     name:'Binance',  spot:true,  futures:true  },
@@ -105,10 +106,8 @@ const EXCHANGES_CONFIG = [
   { id:'bitstamp',    name:'Bitstamp', spot:true,  futures:false },
 ];
 
-// signalsByExchange[exchangeId] = [ {symbol, figure, direction, ...}, ... ]
-// Garde TOUS les signaux détectés sur chaque plateforme scannée ce cycle
 const signalsByExchange = {};
-const signalsCache = []; // liste plate de tous les signaux (compat avec routes existantes)
+const signalsCache = [];
 let lastScanTime = null;
 const marketsCache = {};
 
@@ -172,29 +171,126 @@ function detectFigure(closes, volumes) {
   return null;
 }
 
-// Scanne UNE plateforme au complet (toutes ses paires USDT actives)
-// et retourne TOUS les signaux détectés (pas de limite artificielle)
-// Scan en lots paralleles (BATCH_SIZE a la fois) pour rester sous 60 secondes
-const BATCH_SIZE = 15;
+// ═══════════════════════════════════════════════════════════════════
+// WEBSOCKET KRAKEN — donnees publiques en continu (sans cle API)
+// On garde en memoire les 50 dernieres bougies 1m de chaque paire,
+// mises a jour en temps reel par le flux WebSocket.
+// Le "scan" devient alors instantane: on lit juste la memoire.
+// ═══════════════════════════════════════════════════════════════════
+const krakenCandles = {}; // { 'BTC/USDT': [{o,h,l,c,v}, ...] }
+let krakenPairsList = [];
+let wsConnected = false;
+let ws = null;
 
-async function scanOneSymbol(exchange, exConfig, markets, symbol) {
+async function fetchKrakenUsdtPairs() {
   try {
-    const ohlcv = await exchange.fetchOHLCV(symbol, '1m', undefined, 50);
-    if (!ohlcv || ohlcv.length < 20) return null;
-    const closes  = ohlcv.map(c => c[4]);
-    const volumes = ohlcv.map(c => c[5]);
-    const price   = closes[closes.length-1];
-    const market  = markets[symbol].type;
+    const exchange = new ccxt.kraken({ enableRateLimit: true, timeout: 10000 });
+    const markets = await exchange.loadMarkets();
+    const pairs = Object.keys(markets)
+      .filter(s => {
+        const m = markets[s];
+        return s.endsWith('/USDT') && m.spot && m.active;
+      })
+      .slice(0, MAX_PAIRS);
+    return pairs;
+  } catch (e) {
+    console.log('Erreur fetchKrakenUsdtPairs:', e.message);
+    return [];
+  }
+}
+
+function connectKrakenWS(pairs) {
+  if (ws) {
+    try { ws.terminate(); } catch(e) {}
+  }
+  ws = new WebSocket('wss://ws.kraken.com/v2');
+
+  ws.on('open', () => {
+    wsConnected = true;
+    console.log(`WebSocket Kraken connecte — abonnement a ${pairs.length} paires`);
+    // Kraken limite le nombre de symboles par message d'abonnement;
+    // on envoie par lots de 50 pour rester safe
+    const CHUNK = 50;
+    for (let i = 0; i < pairs.length; i += CHUNK) {
+      const chunk = pairs.slice(i, i + CHUNK);
+      ws.send(JSON.stringify({
+        method: 'subscribe',
+        params: {
+          channel: 'ohlc',
+          symbol: chunk,
+          interval: 1
+        }
+      }));
+    }
+  });
+
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw);
+      if (msg.channel === 'ohlc' && (msg.type === 'snapshot' || msg.type === 'update') && msg.data) {
+        for (const c of msg.data) {
+          const sym = c.symbol; // ex: "BTC/USDT"
+          if (!krakenCandles[sym]) krakenCandles[sym] = [];
+          const candle = {
+            o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume,
+            t: c.interval_begin
+          };
+          const arr = krakenCandles[sym];
+          // Si meme intervalle de temps, on remplace la derniere bougie (mise a jour live)
+          // sinon on en ajoute une nouvelle
+          if (arr.length > 0 && arr[arr.length - 1].t === candle.t) {
+            arr[arr.length - 1] = candle;
+          } else {
+            arr.push(candle);
+            if (arr.length > 60) arr.shift();
+          }
+        }
+      }
+    } catch (e) {}
+  });
+
+  ws.on('close', () => {
+    wsConnected = false;
+    console.log('WebSocket Kraken deconnecte — reconnexion dans 5s');
+    setTimeout(() => connectKrakenWS(krakenPairsList), 5000);
+  });
+
+  ws.on('error', (err) => {
+    console.log('Erreur WebSocket Kraken:', err.message);
+  });
+}
+
+async function initKrakenWS() {
+  krakenPairsList = await fetchKrakenUsdtPairs();
+  if (krakenPairsList.length === 0) {
+    console.log('Aucune paire Kraken trouvee — retry dans 15s');
+    setTimeout(initKrakenWS, 15000);
+    return;
+  }
+  console.log(`${krakenPairsList.length} paires USDT Kraken trouvees pour le flux WebSocket`);
+  connectKrakenWS(krakenPairsList);
+}
+
+// Scan instantane: lit les bougies deja en memoire (mises a jour par le WebSocket)
+// au lieu de faire des requetes HTTP une par une.
+function scanKrakenFromMemory() {
+  const results = [];
+  for (const symbol of krakenPairsList) {
+    const candles = krakenCandles[symbol];
+    if (!candles || candles.length < 20) continue;
+    const closes  = candles.map(c => c.c);
+    const volumes = candles.map(c => c.v);
+    const price   = closes[closes.length - 1];
     const sig = detectFigure(closes, volumes);
-    if (!sig) return null;
+    if (!sig) continue;
 
     const volRatio = volumes[volumes.length-1] / avg(volumes.slice(-20));
     const signal = {
       symbol,
-      exchange:    exConfig.name,
-      exchangeId:  exConfig.id,
+      exchange:    'Kraken',
+      exchangeId:  'kraken',
       timeframe:   '1m',
-      market:      market === 'spot' ? 'Spot' : 'Futures',
+      market:      'Spot',
       figure:      sig.fig.name,
       figureCode:  sig.fig.code,
       direction:   sig.fig.dir,
@@ -209,21 +305,21 @@ async function scanOneSymbol(exchange, exConfig, markets, symbol) {
       commission:  (TRADE_AMOUNT*COMM_RATE).toFixed(4),
       time:        new Date()
     };
+    results.push(signal);
 
     new Signal({
-      symbol, exchange:exConfig.name, market:signal.market,
+      symbol, exchange:'Kraken', market:'Spot',
       figure:sig.fig.name, direction:sig.fig.dir,
       confidence:signal.confidence, entryPrice:price,
       tp:sig.tp, sl:sig.sl, volumeRatio:volRatio, timeframe:'1m'
     }).save().catch(()=>{});
-
-    return signal;
-  } catch(e) {
-    return null;
   }
+  return results;
 }
 
-async function scanExchange(exConfig) {
+// Pour les plateformes autres que Kraken (pas encore branchees en WebSocket),
+// on garde l'ancienne methode REST ccxt en repli, plus lente mais fonctionnelle.
+async function scanExchangeRest(exConfig) {
   const results = [];
   try {
     const ExClass = ccxt[exConfig.id];
@@ -244,18 +340,36 @@ async function scanExchange(exConfig) {
         const isFut  = (m.type === 'future' || m.type === 'swap') && exConfig.futures;
         return isUSDT && (isSpot || isFut) && m.active;
       })
-      .slice(0, 500);
+      .slice(0, 100); // limite plus basse en REST pour rester sous 60s
 
-    // Scan par lots de BATCH_SIZE en parallele (au lieu d'un par un)
-    for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
-      const batch = symbols.slice(i, i + BATCH_SIZE);
-      const batchResults = await Promise.all(
-        batch.map(symbol => scanOneSymbol(exchange, exConfig, markets, symbol))
-      );
+    const BATCH = 15;
+    for (let i = 0; i < symbols.length; i += BATCH) {
+      const batch = symbols.slice(i, i + BATCH);
+      const batchResults = await Promise.all(batch.map(async (symbol) => {
+        try {
+          const ohlcv = await exchange.fetchOHLCV(symbol, '1m', undefined, 50);
+          if (!ohlcv || ohlcv.length < 20) return null;
+          const closes  = ohlcv.map(c => c[4]);
+          const volumes = ohlcv.map(c => c[5]);
+          const price   = closes[closes.length-1];
+          const market  = markets[symbol].type;
+          const sig = detectFigure(closes, volumes);
+          if (!sig) return null;
+          const volRatio = volumes[volumes.length-1] / avg(volumes.slice(-20));
+          return {
+            symbol, exchange: exConfig.name, exchangeId: exConfig.id, timeframe: '1m',
+            market: market === 'spot' ? 'Spot' : 'Futures',
+            figure: sig.fig.name, figureCode: sig.fig.code, direction: sig.fig.dir,
+            confidence: Math.round(sig.fig.wr * 100), entryPrice: price,
+            tp: sig.tp, sl: sig.sl, volumeRatio: volRatio.toFixed(2),
+            tradeAmount: TRADE_AMOUNT, gain: (TRADE_AMOUNT*TP_PCT).toFixed(4),
+            loss: (TRADE_AMOUNT*SL_PCT).toFixed(4), commission: (TRADE_AMOUNT*COMM_RATE).toFixed(4),
+            time: new Date()
+          };
+        } catch(e) { return null; }
+      }));
       batchResults.forEach(r => { if (r) results.push(r); });
     }
-
-    console.log(`[${exConfig.name}] ${symbols.length} paires scannees · ${results.length} signal(s)`);
   } catch(e) {
     console.log(`[${exConfig.name}] Erreur: ${e.message}`);
   }
@@ -275,64 +389,66 @@ async function scanAll() {
   Object.keys(signalsByExchange).forEach(k => delete signalsByExchange[k]);
 
   try {
-  // Scanner SEULEMENT les plateformes des utilisateurs actifs
-  const users = await User.find({ active:true, apiKey:{$exists:true} });
+    const users = await User.find({ active:true, apiKey:{$exists:true} });
 
-  if (users.length === 0) {
-    // Pas d'utilisateur connecte — scan Kraken par defaut pour les tests
-    console.log('Aucun utilisateur — scan Kraken par defaut (mode test)');
-    const krakenConfig = EXCHANGES_CONFIG.find(e => e.id === 'kraken');
-    if (krakenConfig) {
-      const results = await scanExchange(krakenConfig);
+    if (users.length === 0) {
+      console.log('Aucun utilisateur — scan Kraken par defaut (mode test, via WebSocket)');
+      const results = scanKrakenFromMemory();
       signalsCache.push(...results);
       signalsByExchange['kraken'] = results;
+      lastScanTime = new Date();
+      console.log(`[Kraken-WS] ${krakenPairsList.length} paires en memoire · ${results.length} signal(s)`);
+      console.log(`=== FIN test · ${signalsCache.length} signaux · ${Date.now()-startTime}ms ===\n`);
+      return;
     }
+
+    const uniqueExchanges = [...new Set(users.map(u => u.exchangeName.toLowerCase()))];
+    console.log(`Utilisateurs: ${users.length} · Plateformes: ${uniqueExchanges.join(', ')}`);
+
+    for (const exchangeId of uniqueExchanges) {
+      const exConfig = EXCHANGES_CONFIG.find(e => e.id === exchangeId || e.name.toLowerCase() === exchangeId);
+      if (!exConfig) continue;
+
+      let results;
+      if (exConfig.id === 'kraken') {
+        // Scan quasi instantane via WebSocket (donnees deja en memoire)
+        results = scanKrakenFromMemory();
+        console.log(`[Kraken-WS] ${krakenPairsList.length} paires en memoire · ${results.length} signal(s)`);
+      } else {
+        // Repli REST plus lent pour les autres plateformes
+        results = await scanExchangeRest(exConfig);
+        console.log(`[${exConfig.name}-REST] ${results.length} signal(s)`);
+      }
+      signalsCache.push(...results);
+      signalsByExchange[exConfig.id] = results;
+    }
+
     lastScanTime = new Date();
-    console.log(`=== FIN test · ${signalsCache.length} signaux · ${Date.now()-startTime}ms ===\n`);
-    return;
-  }
+    console.log(`=== FIN · ${signalsCache.length} signaux · ${Date.now()-startTime}ms ===\n`);
 
-  // Trouver les plateformes uniques des utilisateurs (chaque utilisateur = 1 seule plateforme, la sienne)
-  const uniqueExchanges = [...new Set(users.map(u => u.exchangeName.toLowerCase()))];
-  console.log(`Utilisateurs: ${users.length} · Plateformes: ${uniqueExchanges.join(', ')}`);
+    for (const user of users) {
+      const userExchangeName = user.exchangeName.toLowerCase();
+      const userSignals = signalsCache.filter(s =>
+        s.exchange.toLowerCase() === userExchangeName ||
+        s.exchangeId === userExchangeName
+      );
 
-  // Scanner seulement ces plateformes, chacune en entier (toutes ses paires)
-  for (const exchangeId of uniqueExchanges) {
-    const exConfig = EXCHANGES_CONFIG.find(e => e.id === exchangeId || e.name.toLowerCase() === exchangeId);
-    if (!exConfig) continue;
-    const results = await scanExchange(exConfig);
-    signalsCache.push(...results);
-    signalsByExchange[exConfig.id] = results;
-  }
-
-  lastScanTime = new Date();
-  console.log(`=== FIN · ${signalsCache.length} signaux · ${Date.now()-startTime}ms ===\n`);
-
-  // Executer trades simules pour chaque utilisateur sur SA plateforme uniquement
-  for (const user of users) {
-    const userExchangeName = user.exchangeName.toLowerCase();
-    const userSignals = signalsCache.filter(s =>
-      s.exchange.toLowerCase() === userExchangeName ||
-      s.exchangeId === userExchangeName
-    );
-
-    // Limite d'exécution simulée (pas de limite de détection/affichage)
-    for (const sig of userSignals.slice(0, MAX_CONCURRENT)) {
-      try {
-        const fig = FIGURES.find(f=>f.name===sig.figure) || FIGURES[0];
-        const won = Math.random() < fig.wr;
-        const amount = user.tradeAmount || TRADE_AMOUNT;
-        const pnl = won ? amount*TP_PCT - amount*COMM_RATE : -(amount*SL_PCT + amount*COMM_RATE);
-        await new Trade({
-          email:user.email, symbol:sig.symbol, exchange:sig.exchange,
-          market:sig.market, direction:sig.direction, figure:sig.figure,
-          entryPrice:sig.entryPrice, exitPrice:won?sig.tp:sig.sl,
-          amount, pnl, commission:amount*COMM_RATE,
-          result:won?'WIN':'LOSS', exitReason:won?'TP +4%':'SL -1%'
-        }).save();
-      } catch(e) {}
+      for (const sig of userSignals.slice(0, MAX_CONCURRENT)) {
+        try {
+          const fig = FIGURES.find(f=>f.name===sig.figure) || FIGURES[0];
+          const won = Math.random() < fig.wr;
+          const amount = user.tradeAmount || TRADE_AMOUNT;
+          const pnl = won ? amount*TP_PCT - amount*COMM_RATE : -(amount*SL_PCT + amount*COMM_RATE);
+          await new Trade({
+            email:user.email, symbol:sig.symbol, exchange:sig.exchange,
+            market:sig.market, direction:sig.direction, figure:sig.figure,
+            entryPrice:sig.entryPrice, exitPrice:won?sig.tp:sig.sl,
+            amount, pnl, commission:amount*COMM_RATE,
+            result:won?'WIN':'LOSS', exitReason:won?'TP +4%':'SL -1%'
+          }).save();
+        } catch(e) {}
+      }
     }
-  }
   } finally {
     scanRunning = false;
   }
@@ -340,12 +456,15 @@ async function scanAll() {
 
 // ROUTES
 app.get('/', (req, res) => res.json({
-  status:        'Bender Pro v7.0 actif',
+  status:        'Bender Pro v8.0 actif',
   strategy:      'Figures chartistes + Volume · Ratio 1:4 · Timeframe 1m',
+  scanMethod:    'WebSocket Kraken (temps reel) + REST en repli pour autres plateformes',
   tradeAmount:   TRADE_AMOUNT,
   slPct:         SL_PCT*100+'%',
   tpPct:         TP_PCT*100+'%',
   exchanges:     EXCHANGES_CONFIG.length,
+  krakenWsConnected: wsConnected,
+  krakenPairsTracked: krakenPairsList.length,
   lastScan:      lastScanTime,
   signalsActive: signalsCache.length,
   wallet:        BENDER_WALLET
@@ -405,41 +524,32 @@ app.get('/exchanges', (req, res) => {
   res.json({ exchanges: EXCHANGES_CONFIG });
 });
 
-// Prix live simples (pour le bandeau ticker et "Marches en direct" du frontend)
 let pricesCache = {};
 let pricesCacheTime = 0;
-async function refreshPrices() {
-  try {
-    const ExClass = ccxt['kraken'];
-    const exchange = new ExClass({ enableRateLimit: true, timeout: 10000 });
-    const symbols = ['BTC/USDT','ETH/USDT','SOL/USDT','BNB/USDT','XRP/USDT','ADA/USDT',
-      'AVAX/USDT','DOGE/USDT','DOT/USDT','MATIC/USDT','LINK/USDT','LTC/USDT',
-      'ATOM/USDT','UNI/USDT','NEAR/USDT','ARB/USDT','OP/USDT','APT/USDT','SUI/USDT','INJ/USDT'];
-    const out = {};
-    for (const sym of symbols) {
-      try {
-        const t = await exchange.fetchTicker(sym);
-        out[sym.split('/')[0]] = {
-          price: t.last,
-          changePct: t.percentage ?? null
-        };
-      } catch(e) {}
+function refreshPricesFromMemory() {
+  const out = {};
+  const watch = ['BTC/USDT','ETH/USDT','SOL/USDT','XRP/USDT','ADA/USDT',
+    'AVAX/USDT','DOGE/USDT','DOT/USDT','LINK/USDT','LTC/USDT',
+    'ATOM/USDT','UNI/USDT','NEAR/USDT','ARB/USDT','OP/USDT','APT/USDT','SUI/USDT','INJ/USDT'];
+  for (const sym of watch) {
+    const candles = krakenCandles[sym];
+    if (candles && candles.length >= 2) {
+      const last = candles[candles.length - 1];
+      const prev = candles[0];
+      out[sym.split('/')[0]] = {
+        price: last.c,
+        changePct: prev.c ? ((last.c - prev.c) / prev.c) * 100 : null
+      };
     }
-    pricesCache = out;
-    pricesCacheTime = Date.now();
-  } catch(e) {
-    console.log('Erreur refreshPrices:', e.message);
   }
+  pricesCache = out;
+  pricesCacheTime = Date.now();
 }
-app.get('/prices', async (req, res) => {
-  if (Date.now() - pricesCacheTime > 30000) await refreshPrices();
+app.get('/prices', (req, res) => {
+  refreshPricesFromMemory();
   res.json({ success: true, prices: pricesCache, time: pricesCacheTime });
 });
-setInterval(refreshPrices, 20000);
-refreshPrices();
 
-// NOUVEAU: tous les signaux détectés sur LA plateforme connectée par cet utilisateur,
-// avec le profit potentiel calculé pour chaque signal (si TP atteint vs si SL touché)
 app.get('/platform-signals/:email', async (req, res) => {
   const user = await User.findOne({ email: req.params.email });
   if (!user) return res.json({ success:false, error:'Utilisateur non trouve' });
@@ -478,7 +588,9 @@ app.get('/admin/stats', async (req, res) => {
     signalsActive:signalsCache.length,
     lastScan:     lastScanTime,
     exchanges:    EXCHANGES_CONFIG.length,
-    wallet:       BENDER_WALLET
+    wallet:       BENDER_WALLET,
+    krakenWsConnected: wsConnected,
+    krakenPairsTracked: krakenPairsList.length
   });
 });
 
@@ -491,12 +603,14 @@ app.post('/toggle', async (req, res) => {
 // DEMARRAGE
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\n Bender Pro v7.0 · Port ${PORT}`);
+  console.log(`\n Bender Pro v8.0 · Port ${PORT}`);
   console.log(` Figures chartistes + Volume · Ratio 1:4 · 1m`);
+  console.log(` Scan Kraken via WebSocket (quasi instantane)`);
   console.log(` Helmet actif · Securite HTTP headers`);
   console.log(` $${TRADE_AMOUNT}/trade · SL -1% · TP +4%`);
   console.log(` Scan toutes les 60 secondes\n`);
-  setTimeout(() => scanAll().catch(console.error), 5000);
+  initKrakenWS();
+  setTimeout(() => scanAll().catch(console.error), 8000);
 });
 
 setInterval(() => scanAll().catch(console.error), SCAN_INTERVAL);
