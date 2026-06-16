@@ -105,8 +105,10 @@ const EXCHANGES_CONFIG = [
   { id:'bitstamp',    name:'Bitstamp', spot:true,  futures:false },
 ];
 
+// signalsByExchange[exchangeId] = [ {symbol, figure, direction, ...}, ... ]
+// Garde TOUS les signaux détectés sur chaque plateforme scannée ce cycle
 const signalsByExchange = {};
-const signalsCache = [];
+const signalsCache = []; // liste plate de tous les signaux (compat avec routes existantes)
 let lastScanTime = null;
 const marketsCache = {};
 
@@ -170,6 +172,57 @@ function detectFigure(closes, volumes) {
   return null;
 }
 
+// Scanne UNE plateforme au complet (toutes ses paires USDT actives)
+// et retourne TOUS les signaux détectés (pas de limite artificielle)
+// Scan en lots paralleles (BATCH_SIZE a la fois) pour rester sous 60 secondes
+const BATCH_SIZE = 15;
+
+async function scanOneSymbol(exchange, exConfig, markets, symbol) {
+  try {
+    const ohlcv = await exchange.fetchOHLCV(symbol, '1m', undefined, 50);
+    if (!ohlcv || ohlcv.length < 20) return null;
+    const closes  = ohlcv.map(c => c[4]);
+    const volumes = ohlcv.map(c => c[5]);
+    const price   = closes[closes.length-1];
+    const market  = markets[symbol].type;
+    const sig = detectFigure(closes, volumes);
+    if (!sig) return null;
+
+    const volRatio = volumes[volumes.length-1] / avg(volumes.slice(-20));
+    const signal = {
+      symbol,
+      exchange:    exConfig.name,
+      exchangeId:  exConfig.id,
+      timeframe:   '1m',
+      market:      market === 'spot' ? 'Spot' : 'Futures',
+      figure:      sig.fig.name,
+      figureCode:  sig.fig.code,
+      direction:   sig.fig.dir,
+      confidence:  Math.round(sig.fig.wr * 100),
+      entryPrice:  price,
+      tp:          sig.tp,
+      sl:          sig.sl,
+      volumeRatio: volRatio.toFixed(2),
+      tradeAmount: TRADE_AMOUNT,
+      gain:        (TRADE_AMOUNT*TP_PCT).toFixed(4),
+      loss:        (TRADE_AMOUNT*SL_PCT).toFixed(4),
+      commission:  (TRADE_AMOUNT*COMM_RATE).toFixed(4),
+      time:        new Date()
+    };
+
+    new Signal({
+      symbol, exchange:exConfig.name, market:signal.market,
+      figure:sig.fig.name, direction:sig.fig.dir,
+      confidence:signal.confidence, entryPrice:price,
+      tp:sig.tp, sl:sig.sl, volumeRatio:volRatio, timeframe:'1m'
+    }).save().catch(()=>{});
+
+    return signal;
+  } catch(e) {
+    return null;
+  }
+}
+
 async function scanExchange(exConfig) {
   const results = [];
   try {
@@ -193,63 +246,40 @@ async function scanExchange(exConfig) {
       })
       .slice(0, 500);
 
-    for (const symbol of symbols) {
-      try {
-        const ohlcv = await exchange.fetchOHLCV(symbol, '1m', undefined, 50);
-        if (!ohlcv || ohlcv.length < 20) continue;
-        const closes  = ohlcv.map(c => c[4]);
-        const volumes = ohlcv.map(c => c[5]);
-        const price   = closes[closes.length-1];
-        const market  = markets[symbol].type;
-        const sig = detectFigure(closes, volumes);
-        if (!sig) continue;
-
-        const volRatio = volumes[volumes.length-1] / avg(volumes.slice(-20));
-        const signal = {
-          symbol,
-          exchange:    exConfig.name,
-          exchangeId:  exConfig.id,
-          timeframe:   '1m',
-          market:      market === 'spot' ? 'Spot' : 'Futures',
-          figure:      sig.fig.name,
-          figureCode:  sig.fig.code,
-          direction:   sig.fig.dir,
-          confidence:  Math.round(sig.fig.wr * 100),
-          entryPrice:  price,
-          tp:          sig.tp,
-          sl:          sig.sl,
-          volumeRatio: volRatio.toFixed(2),
-          tradeAmount: TRADE_AMOUNT,
-          gain:        (TRADE_AMOUNT*TP_PCT).toFixed(4),
-          loss:        (TRADE_AMOUNT*SL_PCT).toFixed(4),
-          commission:  (TRADE_AMOUNT*COMM_RATE).toFixed(4),
-          time:        new Date()
-        };
-        results.push(signal);
-
-        await new Signal({
-          symbol, exchange:exConfig.name, market:signal.market,
-          figure:sig.fig.name, direction:sig.fig.dir,
-          confidence:signal.confidence, entryPrice:price,
-          tp:sig.tp, sl:sig.sl, volumeRatio:volRatio, timeframe:'1m'
-        }).save().catch(()=>{});
-
-      } catch(e) {}
+    // Scan par lots de BATCH_SIZE en parallele (au lieu d'un par un)
+    for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
+      const batch = symbols.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.all(
+        batch.map(symbol => scanOneSymbol(exchange, exConfig, markets, symbol))
+      );
+      batchResults.forEach(r => { if (r) results.push(r); });
     }
+
+    console.log(`[${exConfig.name}] ${symbols.length} paires scannees · ${results.length} signal(s)`);
   } catch(e) {
     console.log(`[${exConfig.name}] Erreur: ${e.message}`);
   }
   return results;
 }
 
+let scanRunning = false;
 async function scanAll() {
+  if (scanRunning) {
+    console.log('Scan precedent encore en cours — on attend le prochain cycle');
+    return;
+  }
+  scanRunning = true;
+  const startTime = Date.now();
   console.log(`\n=== SCAN 1m — ${new Date().toLocaleTimeString()} ===`);
   signalsCache.length = 0;
   Object.keys(signalsByExchange).forEach(k => delete signalsByExchange[k]);
 
+  try {
+  // Scanner SEULEMENT les plateformes des utilisateurs actifs
   const users = await User.find({ active:true, apiKey:{$exists:true} });
 
   if (users.length === 0) {
+    // Pas d'utilisateur connecte — scan Kraken par defaut pour les tests
     console.log('Aucun utilisateur — scan Kraken par defaut (mode test)');
     const krakenConfig = EXCHANGES_CONFIG.find(e => e.id === 'kraken');
     if (krakenConfig) {
@@ -258,13 +288,15 @@ async function scanAll() {
       signalsByExchange['kraken'] = results;
     }
     lastScanTime = new Date();
-    console.log(`=== FIN test · ${signalsCache.length} signaux ===\n`);
+    console.log(`=== FIN test · ${signalsCache.length} signaux · ${Date.now()-startTime}ms ===\n`);
     return;
   }
 
+  // Trouver les plateformes uniques des utilisateurs (chaque utilisateur = 1 seule plateforme, la sienne)
   const uniqueExchanges = [...new Set(users.map(u => u.exchangeName.toLowerCase()))];
   console.log(`Utilisateurs: ${users.length} · Plateformes: ${uniqueExchanges.join(', ')}`);
 
+  // Scanner seulement ces plateformes, chacune en entier (toutes ses paires)
   for (const exchangeId of uniqueExchanges) {
     const exConfig = EXCHANGES_CONFIG.find(e => e.id === exchangeId || e.name.toLowerCase() === exchangeId);
     if (!exConfig) continue;
@@ -274,8 +306,9 @@ async function scanAll() {
   }
 
   lastScanTime = new Date();
-  console.log(`=== FIN · ${signalsCache.length} signaux ===\n`);
+  console.log(`=== FIN · ${signalsCache.length} signaux · ${Date.now()-startTime}ms ===\n`);
 
+  // Executer trades simules pour chaque utilisateur sur SA plateforme uniquement
   for (const user of users) {
     const userExchangeName = user.exchangeName.toLowerCase();
     const userSignals = signalsCache.filter(s =>
@@ -283,6 +316,7 @@ async function scanAll() {
       s.exchangeId === userExchangeName
     );
 
+    // Limite d'exécution simulée (pas de limite de détection/affichage)
     for (const sig of userSignals.slice(0, MAX_CONCURRENT)) {
       try {
         const fig = FIGURES.find(f=>f.name===sig.figure) || FIGURES[0];
@@ -298,6 +332,9 @@ async function scanAll() {
         }).save();
       } catch(e) {}
     }
+  }
+  } finally {
+    scanRunning = false;
   }
 }
 
@@ -368,6 +405,7 @@ app.get('/exchanges', (req, res) => {
   res.json({ exchanges: EXCHANGES_CONFIG });
 });
 
+// Prix live simples (pour le bandeau ticker et "Marches en direct" du frontend)
 let pricesCache = {};
 let pricesCacheTime = 0;
 async function refreshPrices() {
@@ -400,6 +438,8 @@ app.get('/prices', async (req, res) => {
 setInterval(refreshPrices, 20000);
 refreshPrices();
 
+// NOUVEAU: tous les signaux détectés sur LA plateforme connectée par cet utilisateur,
+// avec le profit potentiel calculé pour chaque signal (si TP atteint vs si SL touché)
 app.get('/platform-signals/:email', async (req, res) => {
   const user = await User.findOne({ email: req.params.email });
   if (!user) return res.json({ success:false, error:'Utilisateur non trouve' });
@@ -448,6 +488,7 @@ app.post('/toggle', async (req, res) => {
   res.json({ success:true, active });
 });
 
+// DEMARRAGE
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n Bender Pro v7.0 · Port ${PORT}`);
