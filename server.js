@@ -105,6 +105,7 @@ const EXCHANGES_CONFIG = [
   { id:'bitstamp',    name:'Bitstamp', spot:true,  futures:false },
 ];
 
+const signalsByExchange = {};
 const signalsCache = [];
 let lastScanTime = null;
 const marketsCache = {};
@@ -233,7 +234,6 @@ async function scanExchange(exConfig) {
           tp:sig.tp, sl:sig.sl, volumeRatio:volRatio, timeframe:'1m'
         }).save().catch(()=>{});
 
-        if (results.length >= MAX_CONCURRENT) break;
       } catch(e) {}
     }
   } catch(e) {
@@ -245,39 +245,37 @@ async function scanExchange(exConfig) {
 async function scanAll() {
   console.log(`\n=== SCAN 1m — ${new Date().toLocaleTimeString()} ===`);
   signalsCache.length = 0;
+  Object.keys(signalsByExchange).forEach(k => delete signalsByExchange[k]);
 
-  // Scanner SEULEMENT les plateformes des utilisateurs actifs
   const users = await User.find({ active:true, apiKey:{$exists:true} });
 
   if (users.length === 0) {
-    // Pas d'utilisateur connecte — scan Kraken par defaut pour les tests
     console.log('Aucun utilisateur — scan Kraken par defaut (mode test)');
     const krakenConfig = EXCHANGES_CONFIG.find(e => e.id === 'kraken');
     if (krakenConfig) {
       const results = await scanExchange(krakenConfig);
       signalsCache.push(...results);
+      signalsByExchange['kraken'] = results;
     }
     lastScanTime = new Date();
     console.log(`=== FIN test · ${signalsCache.length} signaux ===\n`);
     return;
   }
 
-  // Trouver les plateformes uniques des utilisateurs
   const uniqueExchanges = [...new Set(users.map(u => u.exchangeName.toLowerCase()))];
   console.log(`Utilisateurs: ${users.length} · Plateformes: ${uniqueExchanges.join(', ')}`);
 
-  // Scanner seulement ces plateformes
   for (const exchangeId of uniqueExchanges) {
     const exConfig = EXCHANGES_CONFIG.find(e => e.id === exchangeId || e.name.toLowerCase() === exchangeId);
     if (!exConfig) continue;
     const results = await scanExchange(exConfig);
     signalsCache.push(...results);
+    signalsByExchange[exConfig.id] = results;
   }
 
   lastScanTime = new Date();
   console.log(`=== FIN · ${signalsCache.length} signaux ===\n`);
 
-  // Executer trades pour chaque utilisateur sur SA plateforme
   for (const user of users) {
     const userExchangeName = user.exchangeName.toLowerCase();
     const userSignals = signalsCache.filter(s =>
@@ -285,7 +283,7 @@ async function scanAll() {
       s.exchangeId === userExchangeName
     );
 
-    for (const sig of userSignals.slice(0, 5)) {
+    for (const sig of userSignals.slice(0, MAX_CONCURRENT)) {
       try {
         const fig = FIGURES.find(f=>f.name===sig.figure) || FIGURES[0];
         const won = Math.random() < fig.wr;
@@ -370,6 +368,63 @@ app.get('/exchanges', (req, res) => {
   res.json({ exchanges: EXCHANGES_CONFIG });
 });
 
+let pricesCache = {};
+let pricesCacheTime = 0;
+async function refreshPrices() {
+  try {
+    const ExClass = ccxt['kraken'];
+    const exchange = new ExClass({ enableRateLimit: true, timeout: 10000 });
+    const symbols = ['BTC/USDT','ETH/USDT','SOL/USDT','BNB/USDT','XRP/USDT','ADA/USDT',
+      'AVAX/USDT','DOGE/USDT','DOT/USDT','MATIC/USDT','LINK/USDT','LTC/USDT',
+      'ATOM/USDT','UNI/USDT','NEAR/USDT','ARB/USDT','OP/USDT','APT/USDT','SUI/USDT','INJ/USDT'];
+    const out = {};
+    for (const sym of symbols) {
+      try {
+        const t = await exchange.fetchTicker(sym);
+        out[sym.split('/')[0]] = {
+          price: t.last,
+          changePct: t.percentage ?? null
+        };
+      } catch(e) {}
+    }
+    pricesCache = out;
+    pricesCacheTime = Date.now();
+  } catch(e) {
+    console.log('Erreur refreshPrices:', e.message);
+  }
+}
+app.get('/prices', async (req, res) => {
+  if (Date.now() - pricesCacheTime > 30000) await refreshPrices();
+  res.json({ success: true, prices: pricesCache, time: pricesCacheTime });
+});
+setInterval(refreshPrices, 20000);
+refreshPrices();
+
+app.get('/platform-signals/:email', async (req, res) => {
+  const user = await User.findOne({ email: req.params.email });
+  if (!user) return res.json({ success:false, error:'Utilisateur non trouve' });
+
+  const exchangeId = user.exchangeName.toLowerCase();
+  const exConfig = EXCHANGES_CONFIG.find(e => e.id === exchangeId || e.name.toLowerCase() === exchangeId);
+  const platformSignals = signalsByExchange[exConfig ? exConfig.id : exchangeId] || [];
+
+  const amount = user.tradeAmount || TRADE_AMOUNT;
+  const enriched = platformSignals.map(s => ({
+    ...s,
+    potentialGainUSD: +(amount * TP_PCT - amount * COMM_RATE).toFixed(4),
+    potentialLossUSD: +(amount * SL_PCT + amount * COMM_RATE).toFixed(4)
+  }));
+
+  res.json({
+    success: true,
+    exchange: exConfig ? exConfig.name : user.exchangeName,
+    tradeAmount: amount,
+    lastScan: lastScanTime,
+    count: enriched.length,
+    signals: enriched
+  });
+});
+
 app.get('/admin/stats', async (req, res) => {
   const users  = await User.countDocuments();
   const active = await User.countDocuments({ active:true });
@@ -393,7 +448,6 @@ app.post('/toggle', async (req, res) => {
   res.json({ success:true, active });
 });
 
-// DEMARRAGE
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n Bender Pro v7.0 · Port ${PORT}`);
