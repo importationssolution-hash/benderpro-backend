@@ -184,15 +184,30 @@ let ws = null;
 
 async function fetchKrakenUsdtPairs() {
   try {
-    const exchange = new ccxt.kraken({ enableRateLimit: true, timeout: 10000 });
+    const exchange = new ccxt.kraken({ enableRateLimit: true, timeout: 15000 });
     const markets = await exchange.loadMarkets();
-    const pairs = Object.keys(markets)
-      .filter(s => {
-        const m = markets[s];
-        return s.endsWith('/USDT') && m.spot && m.active;
-      })
-      .slice(0, MAX_PAIRS);
-    return pairs;
+    const allSymbols = Object.keys(markets);
+    console.log(`[Diagnostic] Kraken: ${allSymbols.length} marches au total via ccxt`);
+
+    const containsUsdt = allSymbols.filter(s => s.includes('USDT'));
+    console.log(`[Diagnostic] ${containsUsdt.length} marches contiennent "USDT" (tous formats)`);
+
+    const pairs = allSymbols.filter(s => {
+      const m = markets[s];
+      const endsUsdt = s.endsWith('/USDT');
+      // m.active peut etre undefined sur certains marches Kraken via ccxt;
+      // on ne rejette que si active est explicitement false
+      const isActive = m.active !== false;
+      const isSpot = m.spot === true || m.type === 'spot';
+      return endsUsdt && isActive && isSpot;
+    });
+    console.log(`[Diagnostic] ${pairs.length} paires retenues apres filtre (spot + actif + /USDT)`);
+
+    if (pairs.length < 50 && containsUsdt.length > pairs.length) {
+      console.log('[Diagnostic] Exemples de paires USDT rejetees:', containsUsdt.slice(0, 10).map(s => `${s} (spot:${markets[s].spot}, active:${markets[s].active}, type:${markets[s].type})`));
+    }
+
+    return pairs.slice(0, MAX_PAIRS);
   } catch (e) {
     console.log('Erreur fetchKrakenUsdtPairs:', e.message);
     return [];
