@@ -1,46 +1,114 @@
-const ccxt = require('ccxt');
+// Bender Pro â€” Module FUTURES Kraken (separe du Spot)
+// Utilise le module https natif de Node.js (pas de node-fetch)
+// et crypto natif pour l'authentification HMAC.
+//
+// IMPORTANT: Kraken Futures est un compte SEPARE de Kraken Spot.
+// Il faut une cle API DIFFERENTE, generee sur futures.kraken.com (pas kraken.com).
+
 const mongoose = require('mongoose');
+const crypto   = require('crypto');
+const https    = require('https');
 
-// ── CONFIG ──
-const COMMISSION_RATE = 0.001; // 0.1%
-const BENDER_WALLET = process.env.BENDER_WALLET;
-const MONGODB_URI = process.env.MONGODB_URI;
-// Paires analysees: USDC et USD seulement (USDT bloque sur Kraken Canada)
-const SYMBOLS = [
-  'BTC/USDC', 'ETH/USDC', 'SOL/USDC',
-  'BTC/USDC', 'ETH/USDC', 'SOL/USDC',
-  'BTC/USD',  'ETH/USD',  'SOL/USD'
-];
-// LIMITE DE SECURITE CODEE EN DUR — jamais depasser ce montant par trade
-// peu importe ce qui est configure dans le profil utilisateur (protection
-// contre une erreur de configuration ou un montant mal saisi).
+// â”€â”€ CONFIG â”€â”€
+const BENDER_WALLET     = process.env.BENDER_WALLET;
+const MONGODB_URI       = process.env.MONGODB_URI;
+const FUTURES_BASE_URL  = 'futures.kraken.com';
+const COMMISSION_RATE   = 0.001;
+const FUTURES_SYMBOLS   = ['PF_XBTUSD', 'PF_ETHUSD', 'PF_SOLUSD'];
 const MAX_TRADE_AMOUNT_USD = 50;
+const MAX_LEVERAGE         = 10;
 
-// ── MONGODB ──
-const UserSchema = new mongoose.Schema({
-  email: String,
-  exchangeName: String,
-  apiKey: String,
-  apiSecret: String,
-  tradeAmount: Number,
-  active: Boolean
+// â”€â”€ MONGODB â”€â”€
+const FuturesUserSchema = new mongoose.Schema({
+  email:       { type: String, required: true, unique: true },
+  apiKey:      String,
+  apiSecret:   String,
+  tradeAmount: { type: Number, default: 2 },
+  leverage:    { type: Number, default: 1 },
+  active:      { type: Boolean, default: true },
+  createdAt:   { type: Date, default: Date.now }
 });
 
-const TradeSchema = new mongoose.Schema({
-  email: String,
-  type: String,
-  symbol: String,
-  price: String,
-  commissionUSD: Number,
-  commissionBTC: Number,
+const FuturesTradeSchema = new mongoose.Schema({
+  email:             String,
+  symbol:            String,
+  side:              String,
+  size:              Number,
+  leverage:          Number,
+  price:             String,
+  commissionUSD:     Number,
   walletDestination: String,
-  time: { type: Date, default: Date.now }
+  orderId:           String,
+  time:              { type: Date, default: Date.now }
 });
 
-const User = mongoose.model('User', UserSchema);
-const Trade = mongoose.model('Trade', TradeSchema);
+const FuturesUser  = mongoose.model('FuturesUser',  FuturesUserSchema);
+const FuturesTrade = mongoose.model('FuturesTrade', FuturesTradeSchema);
 
-// ── ALGORITHME ──
+// â”€â”€ HTTP natif â”€â”€
+function httpsGet(hostname, path) {
+  return new Promise((resolve, reject) => {
+    const req = https.request({ hostname, path, method: 'GET', headers: { 'User-Agent': 'BenderPro/8.0' } }, res => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch(e) { reject(new Error('JSON parse error: ' + data.slice(0, 100))); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.end();
+  });
+}
+
+function httpsPost(hostname, path, body, headers) {
+  return new Promise((resolve, reject) => {
+    const postData = body;
+    const options = {
+      hostname, path, method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(postData), ...headers }
+    };
+    const req = https.request(options, res => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch(e) { reject(new Error('JSON parse error: ' + data.slice(0, 100))); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.write(postData);
+    req.end();
+  });
+}
+
+// â”€â”€ AUTHENTIFICATION KRAKEN FUTURES â”€â”€
+function signFuturesRequest(endpointPath, postData, nonce, apiSecret) {
+  const message = postData + nonce + endpointPath;
+  const hash = crypto.createHash('sha256').update(message).digest();
+  const secretDecoded = Buffer.from(apiSecret, 'base64');
+  const hmac = crypto.createHmac('sha512', secretDecoded).update(hash).digest('base64');
+  return hmac;
+}
+
+async function futuresGet(path, apiKey, apiSecret) {
+  const nonce = Date.now().toString();
+  const signPath = path.replace('/derivatives', '');
+  const authent = signFuturesRequest(signPath, '', nonce, apiSecret);
+  return httpsGet(FUTURES_BASE_URL, path, { APIKey: apiKey, Nonce: nonce, Authent: authent });
+}
+
+async function futuresPost(path, apiKey, apiSecret, params) {
+  const nonce = Date.now().toString();
+  const signPath = path.replace('/derivatives', '');
+  const postData = new URLSearchParams(params).toString();
+  const authent = signFuturesRequest(signPath, postData, nonce, apiSecret);
+  return httpsPost(FUTURES_BASE_URL, path, postData, { APIKey: apiKey, Nonce: nonce, Authent: authent });
+}
+
+// â”€â”€ ALGORITHME RSI/EMA (identique au bot Spot) â”€â”€
 function calcRSI(prices) {
   if (prices.length < 15) return 50;
   let g = 0, l = 0;
@@ -63,186 +131,111 @@ function getSignal(prices) {
   const rsi = calcRSI(prices);
   const e20 = calcEMA(prices, 20);
   const e50 = calcEMA(prices, 50);
-  const p = prices[prices.length-1];
+  const p   = prices[prices.length-1];
   let score = 0;
-  if (rsi < 30) score += 3;
-  else if (rsi < 40) score += 1;
-  else if (rsi > 70) score -= 3;
-  else if (rsi > 60) score -= 1;
+  if (rsi < 30) score += 3; else if (rsi < 40) score += 1;
+  else if (rsi > 70) score -= 3; else if (rsi > 60) score -= 1;
   if (e20 > e50) score += 1; else score -= 1;
-  if (p > e50) score += 1; else score -= 1;
+  if (p > e50)   score += 1; else score -= 1;
   const conf = Math.min(92, Math.abs(score)*10+55);
-  if (score >= 3) return { signal:'BUY', confidence:Math.round(conf) };
-  if (score <= -3) return { signal:'SELL', confidence:Math.round(conf) };
-  return { signal:'WAIT', confidence:Math.round(conf) };
+  if (score >= 3)  return { signal:'BUY',  confidence: Math.round(conf) };
+  if (score <= -3) return { signal:'SELL', confidence: Math.round(conf) };
+  return { signal:'WAIT', confidence: Math.round(conf) };
 }
 
-// Applique la limite de securite codee en dur, peu importe le tradeAmount configure
-function getSafeTradeAmount(requestedAmount) {
-  const amount = Number(requestedAmount) || 0;
-  if (amount <= 0) return 0;
-  return Math.min(amount, MAX_TRADE_AMOUNT_USD);
-}
-
-// ── TRADING RÉEL ──
-async function tradeUser(user) {
+// Recupere les bougies 1h via l'API publique Futures (sans auth)
+async function fetchFuturesCandles(symbol) {
   try {
-    const ExchangeClass = ccxt[user.exchangeName.toLowerCase()];
-    if (!ExchangeClass) {
-      console.log('Exchange non supporte:', user.exchangeName);
+    const data = await httpsGet('futures.kraken.com', `/api/charts/v1/trade/${symbol}/1h?count=100`);
+    if (!data.candles) return [];
+    return data.candles.map(c => parseFloat(c.close));
+  } catch (e) {
+    console.log('Erreur fetchFuturesCandles', symbol, ':', e.message);
+    return [];
+  }
+}
+
+function getSafeTradeAmount(v) { return Math.min(Math.max(Number(v)||0, 0), MAX_TRADE_AMOUNT_USD); }
+function getSafeLeverage(v)    { return Math.min(Math.max(Number(v)||1, 1), MAX_LEVERAGE); }
+
+// â”€â”€ TRADING REEL FUTURES â”€â”€
+async function tradeUserFutures(user) {
+  try {
+    console.log('Futures trading pour:', user.email);
+    const accountsRes = await futuresGet('/derivatives/api/v3/accounts', user.apiKey, user.apiSecret);
+    if (accountsRes.result !== 'success') {
+      console.log('Erreur compte futures:', accountsRes.error || JSON.stringify(accountsRes));
       return;
     }
+    const availableMargin = accountsRes.accounts?.flex?.availableMargin || 0;
+    console.log(`Marge disponible: ${availableMargin} USD`);
+    if (availableMargin <= 0) { console.log('Aucune marge disponible'); return; }
 
-    const exchange = new ExchangeClass({
-      apiKey: user.apiKey,
-      secret: user.apiSecret,
-      enableRateLimit: true
-    });
+    const safeAmount   = getSafeTradeAmount(user.tradeAmount);
+    const safeLeverage = getSafeLeverage(user.leverage);
 
-    console.log('Trading pour:', user.email, 'sur', user.exchangeName);
-
-    let balance;
-    try {
-      balance = await exchange.fetchBalance();
-    } catch (e) {
-      console.log('Erreur fetchBalance pour', user.email, ':', e.message);
-      return;
-    }
-
-    const usdc = balance.USDC?.free || 0;
-    const usd  = balance.USD?.free  || 0;
-    console.log(`Balance ${user.email} — USDC:${usdc} USD:${usd}`);
-
-    if (usdc + usd <= 0) {
-      console.log('Aucun fonds disponible (USDC/USD) pour', user.email, '— aucun trade possible');
-      return;
-    }
-
-    const safeTradeAmount = getSafeTradeAmount(user.tradeAmount);
-    if (safeTradeAmount <= 0) {
-      console.log('Montant de trade invalide pour', user.email);
-      return;
-    }
-    if (Number(user.tradeAmount) > MAX_TRADE_AMOUNT_USD) {
-      console.log(`Attention: tradeAmount configure (${user.tradeAmount}$) depasse la limite de securite — plafonne a ${MAX_TRADE_AMOUNT_USD}$`);
-    }
-
-    for (const symbol of SYMBOLS) {
+    for (const symbol of FUTURES_SYMBOLS) {
       try {
-        const [base, quote] = symbol.split('/');
-        // On ne tente le symbole que si l'utilisateur a des fonds dans la devise de cotation
-        const quoteBalance = balance[quote]?.free || 0;
+        const prices = await fetchFuturesCandles(symbol);
+        if (prices.length < 20) continue;
+        const sig   = getSignal(prices);
+        const price = prices[prices.length - 1];
+        console.log(symbol, '-', sig.signal, sig.confidence + '% Â· levier ' + safeLeverage + 'x');
+        if (sig.signal === 'WAIT' || sig.confidence <= 65) continue;
+        if (availableMargin < safeAmount) { console.log('Marge insuffisante pour', symbol); continue; }
 
-        const ohlcv = await exchange.fetchOHLCV(symbol, '1h', undefined, 100);
-        const prices = ohlcv.map(c => c[4]);
-        const sig = getSignal(prices);
-        const price = prices[prices.length-1];
+        const side         = sig.signal === 'BUY' ? 'buy' : 'sell';
+        const positionSize = (safeAmount * safeLeverage) / price;
 
-        console.log(symbol, '-', sig.signal, sig.confidence+'%');
+        console.log(`ORDRE FUTURES ${side.toUpperCase()}: ${symbol} Â· taille ${positionSize.toFixed(4)} Â· ${safeLeverage}x`);
+        const orderRes = await futuresPost('/derivatives/api/v3/sendorder', user.apiKey, user.apiSecret, {
+          orderType: 'mkt', symbol, side, size: positionSize.toFixed(4)
+        });
 
-        if (sig.signal === 'BUY' && sig.confidence > 65 && quoteBalance >= safeTradeAmount) {
-          const commissionUSD = safeTradeAmount * COMMISSION_RATE;
-          const commissionBTC = commissionUSD / price;
-
-          console.log('ORDRE REEL BUY:', symbol, '·', safeTradeAmount, quote, '· Commission:', commissionUSD.toFixed(4));
-
-          // Execution reelle de l'ordre sur la plateforme connectee
-          const order = await exchange.createMarketBuyOrder(symbol, safeTradeAmount / price);
-          console.log('Ordre execute:', order.id);
-
-          await new Trade({
-            email: user.email,
-            type: 'BUY',
-            symbol,
-            price: price.toFixed(2),
-            commissionUSD,
-            commissionBTC,
-            walletDestination: BENDER_WALLET
+        if (orderRes.result === 'success' && orderRes.sendStatus?.status === 'placed') {
+          const orderId = orderRes.sendStatus.order_id;
+          console.log('Ordre futures execute:', orderId);
+          await new FuturesTrade({
+            email: user.email, symbol, side, size: positionSize,
+            leverage: safeLeverage, price: price.toFixed(2),
+            commissionUSD: safeAmount * COMMISSION_RATE,
+            walletDestination: BENDER_WALLET, orderId
           }).save();
-
-          console.log('Trade BUY enregistre pour', user.email);
+        } else {
+          console.log('Echec ordre futures:', JSON.stringify(orderRes.sendStatus || orderRes.error));
         }
-
-        if (sig.signal === 'SELL' && sig.confidence > 65) {
-          const baseBalance = balance[base]?.free || 0;
-
-          if (baseBalance > 0.0001) {
-            const tradeValue = baseBalance * price;
-            const commissionUSD = tradeValue * COMMISSION_RATE;
-            const commissionBTC = commissionUSD / price;
-
-            console.log('ORDRE REEL SELL:', symbol, '·', baseBalance, base);
-
-            const order = await exchange.createMarketSellOrder(symbol, baseBalance);
-            console.log('Ordre execute:', order.id);
-
-            await new Trade({
-              email: user.email,
-              type: 'SELL',
-              symbol,
-              price: price.toFixed(2),
-              commissionUSD,
-              commissionBTC,
-              walletDestination: BENDER_WALLET
-            }).save();
-
-            console.log('Trade SELL enregistre pour', user.email);
-          }
-        }
-
-      } catch(e) {
-        console.log('Erreur', symbol+':', e.message);
-      }
+      } catch (e) { console.log('Erreur', symbol, ':', e.message); }
     }
-
-  } catch(e) {
-    console.log('Erreur utilisateur', user.email+':', e.message);
-  }
+  } catch (e) { console.log('Erreur utilisateur futures', user.email, ':', e.message); }
 }
 
-// ── CYCLE PRINCIPAL ──
-async function runCycle() {
-  console.log('=== Bender Pro Bot - Cycle de trading ===');
+// â”€â”€ CYCLE â”€â”€
+async function runFuturesCycle() {
+  console.log('=== Bender Pro Futures - Cycle ===');
   console.log('Heure:', new Date().toISOString());
-  console.log('Wallet BTC:', BENDER_WALLET);
-  console.log('Limite de securite par trade:', MAX_TRADE_AMOUNT_USD, 'USD');
-
-  const users = await User.find({ active: true, apiKey: { $exists: true } });
-  console.log('Utilisateurs actifs:', users.length);
-
-  for (const user of users) {
-    await tradeUser(user);
-  }
-
-  console.log('=== Cycle termine ===');
+  const users = await FuturesUser.find({ active: true, apiKey: { $exists: true } });
+  console.log('Utilisateurs Futures actifs:', users.length);
+  for (const user of users) { await tradeUserFutures(user); }
+  console.log('=== Cycle Futures termine ===');
 }
 
-// ── MAIN ──
-// Mode boucle: tourne en continu (declenche automatiquement chaque minute).
-// Utiliser `node bot.js --once` pour un seul cycle puis arret (utile pour tester).
+// â”€â”€ MAIN â”€â”€
 async function main() {
-  if (!MONGODB_URI) {
-    console.log('MONGODB_URI manquant !');
-    process.exit(1);
-  }
-
+  if (!MONGODB_URI) { console.log('MONGODB_URI manquant !'); process.exit(1); }
   await mongoose.connect(MONGODB_URI);
-  console.log('MongoDB connecte !');
-
+  console.log('MongoDB connecte (Futures)!');
   const runOnce = process.argv.includes('--once');
-
   if (runOnce) {
-    await runCycle();
+    await runFuturesCycle();
     process.exit(0);
   } else {
-    await runCycle();
-    setInterval(() => {
-      runCycle().catch(err => console.error('Erreur cycle:', err.message));
-    }, 60 * 1000);
+    await runFuturesCycle();
+    setInterval(() => runFuturesCycle().catch(e => console.error('Erreur cycle futures:', e.message)), 60000);
   }
 }
 
-main().catch(err => {
-  console.error('Erreur fatale:', err.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(err => { console.error('Erreur fatale futures:', err.message); process.exit(1); });
+}
+
+module.exports = { FuturesUser, FuturesTrade, runFuturesCycle, MAX_TRADE_AMOUNT_USD, MAX_LEVERAGE };
