@@ -182,7 +182,7 @@ let krakenPairsList = [];
 let wsConnected = false;
 let ws = null;
 
-const QUOTE_CURRENCIES = ['USDT', 'USDC', 'USD'];
+const QUOTE_CURRENCIES = ['USDC', 'USD']; // USDT retire: bloque sur Kraken Canada
 
 async function fetchKrakenUsdtPairs() {
   try {
@@ -204,7 +204,7 @@ async function fetchKrakenUsdtPairs() {
       const count = pairs.filter(s => s.endsWith('/' + q)).length;
       console.log(`[Diagnostic] ${count} paires /${q} retenues`);
     });
-    console.log(`[Diagnostic] ${pairs.length} paires au total (USDT+USDC+USD)`);
+    console.log(`[Diagnostic] ${pairs.length} paires au total (USDC+USD, USDT exclu - bloque au Canada)`);
 
     return pairs.slice(0, MAX_PAIRS);
   } catch (e) {
@@ -281,7 +281,7 @@ async function initKrakenWS() {
     setTimeout(initKrakenWS, 15000);
     return;
   }
-  console.log(`${krakenPairsList.length} paires (USDT/USDC/USD) Kraken trouvees pour le flux WebSocket`);
+  console.log(`${krakenPairsList.length} paires (USDC/USD) Kraken trouvees pour le flux WebSocket`);
   connectKrakenWS(krakenPairsList);
 }
 
@@ -565,10 +565,25 @@ app.get('/status/:email', async (req, res) => {
 });
 
 app.get('/trades/:email', async (req, res) => {
-  const trades = await Trade.find({ email:req.params.email }).sort({time:-1}).limit(100);
-  const totalPnl = trades.reduce((a,t)=>a+t.pnl,0);
-  const wins = trades.filter(t=>t.result==='WIN').length;
-  res.json({ trades, totalPnl:totalPnl.toFixed(4), wins, losses:trades.length-wins });
+  const email = req.params.email;
+  // Totaux calcules sur TOUT l'historique (pas seulement les 100 affiches)
+  const totalCount = await Trade.countDocuments({ email });
+  const allTrades = await Trade.find({ email });
+  const totalPnl = allTrades.reduce((a,t)=>a+t.pnl,0);
+  const totalWins = allTrades.filter(t=>t.result==='WIN').length;
+  const totalLosses = totalCount - totalWins;
+
+  // Liste detaillee: seulement les 100 plus recents (pour l'affichage)
+  const trades = await Trade.find({ email }).sort({time:-1}).limit(100);
+
+  res.json({
+    trades,
+    totalTradesCount: totalCount,
+    totalPnl: totalPnl.toFixed(4),
+    wins: totalWins,
+    losses: totalLosses,
+    displayedCount: trades.length
+  });
 });
 
 app.get('/signals', async (req, res) => {
@@ -584,9 +599,9 @@ let pricesCache = {};
 let pricesCacheTime = 0;
 function refreshPricesFromMemory() {
   const out = {};
-  const watch = ['BTC/USDT','ETH/USDT','SOL/USDT','XRP/USDT','ADA/USDT',
-    'AVAX/USDT','DOGE/USDT','DOT/USDT','LINK/USDT','LTC/USDT',
-    'ATOM/USDT','UNI/USDT','NEAR/USDT','ARB/USDT','OP/USDT','APT/USDT','SUI/USDT','INJ/USDT'];
+  const watch = ['BTC/USDC','ETH/USDC','SOL/USDC','XRP/USDC','ADA/USDC',
+    'AVAX/USDC','DOGE/USDC','DOT/USDC','LINK/USDC','LTC/USDC',
+    'ATOM/USDC','UNI/USDC','NEAR/USDC','ARB/USDC','OP/USDC','APT/USDC','SUI/USDC','INJ/USDC'];
   for (const sym of watch) {
     const candles = krakenCandles[sym];
     if (candles && candles.length >= 2) {
