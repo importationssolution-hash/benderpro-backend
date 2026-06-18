@@ -1,4 +1,4 @@
-// Bender Pro v8.0 â€” Scan via WebSocket Kraken (quasi instantane)
+// Bender Pro v8.0 — Scan via WebSocket Kraken (quasi instantane)
 // npm install express cors mongoose ccxt helmet ws
 const express = require('express');
 const cors = require('cors');
@@ -89,7 +89,7 @@ const FIGURES = [
   { name:'Biseau Baissier',  code:'BisB',  dir:'Long',  wr:0.73 },
 ];
 
-// EXCHANGES (affichage seulement â€” le scan WebSocket rapide ne couvre que Kraken pour l'instant)
+// EXCHANGES (affichage seulement — le scan WebSocket rapide ne couvre que Kraken pour l'instant)
 const EXCHANGES_CONFIG = [
   { id:'kraken',      name:'Kraken',   spot:true,  futures:true  },
   { id:'binance',     name:'Binance',  spot:true,  futures:true  },
@@ -171,12 +171,12 @@ function detectFigure(closes, volumes) {
   return null;
 }
 
-// â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• 
-// WEBSOCKET KRAKEN â€” donnees publiques en continu (sans cle API)
+// ═══════════════════════════════════════════════════════════════════
+// WEBSOCKET KRAKEN — donnees publiques en continu (sans cle API)
 // On garde en memoire les 50 dernieres bougies 1m de chaque paire,
 // mises a jour en temps reel par le flux WebSocket.
 // Le "scan" devient alors instantane: on lit juste la memoire.
-// â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• 
+// ═══════════════════════════════════════════════════════════════════
 const krakenCandles = {}; // { 'BTC/USDT': [{o,h,l,c,v}, ...] }
 let krakenPairsList = [];
 let wsConnected = false;
@@ -221,7 +221,7 @@ function connectKrakenWS(pairs) {
 
   ws.on('open', () => {
     wsConnected = true;
-    console.log(`WebSocket Kraken connecte â€” abonnement a ${pairs.length} paires`);
+    console.log(`WebSocket Kraken connecte — abonnement a ${pairs.length} paires`);
     // Kraken limite le nombre de symboles par message d'abonnement;
     // on envoie par lots de 50 pour rester safe
     const CHUNK = 50;
@@ -265,7 +265,7 @@ function connectKrakenWS(pairs) {
 
   ws.on('close', () => {
     wsConnected = false;
-    console.log('WebSocket Kraken deconnecte â€” reconnexion dans 5s');
+    console.log('WebSocket Kraken deconnecte — reconnexion dans 5s');
     setTimeout(() => connectKrakenWS(krakenPairsList), 5000);
   });
 
@@ -277,7 +277,7 @@ function connectKrakenWS(pairs) {
 async function initKrakenWS() {
   krakenPairsList = await fetchKrakenUsdtPairs();
   if (krakenPairsList.length === 0) {
-    console.log('Aucune paire Kraken trouvee â€” retry dans 15s');
+    console.log('Aucune paire Kraken trouvee — retry dans 15s');
     setTimeout(initKrakenWS, 15000);
     return;
   }
@@ -393,12 +393,12 @@ async function scanExchangeRest(exConfig) {
 let scanRunning = false;
 async function scanAll() {
   if (scanRunning) {
-    console.log('Scan precedent encore en cours â€” on attend le prochain cycle');
+    console.log('Scan precedent encore en cours — on attend le prochain cycle');
     return;
   }
   scanRunning = true;
   const startTime = Date.now();
-  console.log(`\n=== SCAN 1m â€” ${new Date().toLocaleTimeString()} ===`);
+  console.log(`\n=== SCAN 1m — ${new Date().toLocaleTimeString()} ===`);
   signalsCache.length = 0;
   Object.keys(signalsByExchange).forEach(k => delete signalsByExchange[k]);
 
@@ -406,18 +406,18 @@ async function scanAll() {
     const users = await User.find({ active:true, apiKey:{$exists:true} });
 
     if (users.length === 0) {
-      console.log('Aucun utilisateur â€” scan Kraken par defaut (mode test, via WebSocket)');
+      console.log('Aucun utilisateur — scan Kraken par defaut (mode test, via WebSocket)');
       const results = scanKrakenFromMemory();
       signalsCache.push(...results);
       signalsByExchange['kraken'] = results;
       lastScanTime = new Date();
-      console.log(`[Kraken-WS] ${krakenPairsList.length} paires en memoire Â· ${results.length} signal(s)`);
-      console.log(`=== FIN test Â· ${signalsCache.length} signaux Â· ${Date.now()-startTime}ms ===\n`);
+      console.log(`[Kraken-WS] ${krakenPairsList.length} paires en memoire · ${results.length} signal(s)`);
+      console.log(`=== FIN test · ${signalsCache.length} signaux · ${Date.now()-startTime}ms ===\n`);
       return;
     }
 
     const uniqueExchanges = [...new Set(users.map(u => u.exchangeName.toLowerCase()))];
-    console.log(`Utilisateurs: ${users.length} Â· Plateformes: ${uniqueExchanges.join(', ')}`);
+    console.log(`Utilisateurs: ${users.length} · Plateformes: ${uniqueExchanges.join(', ')}`);
 
     for (const exchangeId of uniqueExchanges) {
       const exConfig = EXCHANGES_CONFIG.find(e => e.id === exchangeId || e.name.toLowerCase() === exchangeId);
@@ -427,7 +427,7 @@ async function scanAll() {
       if (exConfig.id === 'kraken') {
         // Scan quasi instantane via WebSocket (donnees deja en memoire)
         results = scanKrakenFromMemory();
-        console.log(`[Kraken-WS] ${krakenPairsList.length} paires en memoire Â· ${results.length} signal(s)`);
+        console.log(`[Kraken-WS] ${krakenPairsList.length} paires en memoire · ${results.length} signal(s)`);
       } else {
         // Repli REST plus lent pour les autres plateformes
         results = await scanExchangeRest(exConfig);
@@ -438,9 +438,9 @@ async function scanAll() {
     }
 
     lastScanTime = new Date();
-    console.log(`=== FIN Â· ${signalsCache.length} signaux Â· ${Date.now()-startTime}ms ===\n`);
+    console.log(`=== FIN · ${signalsCache.length} signaux · ${Date.now()-startTime}ms ===\n`);
 
-    // â”€â”€ EXECUTION REELLE DES TRADES (plus de simulation Math.random) â”€â”€
+    // ── EXECUTION REELLE DES TRADES (plus de simulation Math.random) ──
     // On utilise directement les signaux deja detectes par le WebSocket
     // pour placer de vrais ordres sur le compte de chaque utilisateur.
     for (const user of users) {
@@ -482,11 +482,11 @@ async function scanAll() {
             const quoteBalance  = balance[quote]?.free || 0;
             const price         = sig.entryPrice;
 
-            // â”€â”€ LONG â†’ BUY â”€â”€
+            // ── LONG → BUY ──
             if (sig.direction === 'Long' && quoteBalance >= amount) {
               const qty           = amount / price;
               const commissionUSD = amount * COMM_RATE;
-              console.log(`[Bot] ORDRE BUY REEL: ${sig.symbol} Â· ${sig.figure} Â· $${amount}`);
+              console.log(`[Bot] ORDRE BUY REEL: ${sig.symbol} · ${sig.figure} · $${amount}`);
               const order = await exchange.createMarketBuyOrder(sig.symbol, qty);
               console.log(`[Bot] Ordre execute: ${order.id}`);
               await new Trade({
@@ -499,13 +499,13 @@ async function scanAll() {
               ordersPlaced++;
             }
 
-            // â”€â”€ SHORT â†’ SELL (si position ouverte sur cette paire) â”€â”€
+            // ── SHORT → SELL (si position ouverte sur cette paire) ──
             if (sig.direction === 'Short') {
               const baseBalance = balance[base]?.free || 0;
               if (baseBalance > 0.000001) {
                 const tradeValue    = baseBalance * price;
                 const commissionUSD = tradeValue * COMM_RATE;
-                console.log(`[Bot] ORDRE SELL REEL: ${sig.symbol} Â· ${sig.figure} Â· ${baseBalance} ${base}`);
+                console.log(`[Bot] ORDRE SELL REEL: ${sig.symbol} · ${sig.figure} · ${baseBalance} ${base}`);
                 const order = await exchange.createMarketSellOrder(sig.symbol, baseBalance);
                 console.log(`[Bot] Ordre execute: ${order.id}`);
                 await new Trade({
@@ -538,7 +538,7 @@ async function scanAll() {
 // ROUTES
 app.get('/', (req, res) => res.json({
   status:        'Bender Pro v8.0 actif',
-  strategy:      'Figures chartistes + Volume Â· Ratio 1:4 Â· Timeframe 1m',
+  strategy:      'Figures chartistes + Volume · Ratio 1:4 · Timeframe 1m',
   scanMethod:    'WebSocket Kraken (temps reel) + REST en repli pour autres plateformes',
   tradeAmount:   TRADE_AMOUNT,
   slPct:         SL_PCT*100+'%',
@@ -573,13 +573,13 @@ app.post('/connect', async (req, res) => {
       { apiKey, apiSecret:secret, exchangeName, active:true, tradeAmount:tradeAmount||TRADE_AMOUNT },
       { upsert:true, new:true }
     );
-    res.json({ success:true, message:`Connecte sur ${exchangeName} Â· $${tradeAmount||TRADE_AMOUNT}/trade Â· Ratio 1:4 Â· 1m` });
+    res.json({ success:true, message:`Connecte sur ${exchangeName} · $${tradeAmount||TRADE_AMOUNT}/trade · Ratio 1:4 · 1m` });
   } catch(e) { res.json({ success:false, error:e.message }); }
 });
 
-// â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• 
-// ROUTES FUTURES â€” systeme separe de Kraken Spot, cle API differente
-// â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• 
+// ═══════════════════════════════════════════════════════════════════
+// ROUTES FUTURES — systeme separe de Kraken Spot, cle API differente
+// ═══════════════════════════════════════════════════════════════════
 const { FuturesUser, FuturesTrade, MAX_TRADE_AMOUNT_USD: FUTURES_MAX_AMOUNT, MAX_LEVERAGE: FUTURES_MAX_LEVERAGE } = require('./bot-futures');
 
 app.post('/connect-futures', async (req, res) => {
@@ -594,7 +594,7 @@ app.post('/connect-futures', async (req, res) => {
     );
     res.json({
       success:true,
-      message:`Connecte sur Kraken Futures Â· $${tradeAmount||2}/trade Â· Levier ${leverage||1}x (max ${FUTURES_MAX_LEVERAGE}x)`
+      message:`Connecte sur Kraken Futures · $${tradeAmount||2}/trade · Levier ${leverage||1}x (max ${FUTURES_MAX_LEVERAGE}x)`
     });
   } catch(e) { res.json({ success:false, error:e.message }); }
 });
@@ -741,11 +741,11 @@ app.post('/toggle', async (req, res) => {
 // DEMARRAGE
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\n Bender Pro v8.0 Â· Port ${PORT}`);
-  console.log(` Figures chartistes + Volume Â· Ratio 1:4 Â· 1m`);
+  console.log(`\n Bender Pro v8.0 · Port ${PORT}`);
+  console.log(` Figures chartistes + Volume · Ratio 1:4 · 1m`);
   console.log(` Scan Kraken via WebSocket (quasi instantane)`);
-  console.log(` Helmet actif Â· Securite HTTP headers`);
-  console.log(` $${TRADE_AMOUNT}/trade Â· SL -1% Â· TP +4%`);
+  console.log(` Helmet actif · Securite HTTP headers`);
+  console.log(` $${TRADE_AMOUNT}/trade · SL -1% · TP +4%`);
   console.log(` Scan toutes les 60 secondes\n`);
   initKrakenWS();
   setTimeout(() => scanAll().catch(console.error), 8000);
@@ -753,59 +753,6 @@ app.listen(PORT, () => {
 
 setInterval(() => scanAll().catch(console.error), SCAN_INTERVAL);
 
-// â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• 
-// EXECUTION REELLE DES TRADES (bot.js) â€” declenchee automatiquement
-// chaque minute, juste apres le scan de signaux.
-// bot.js utilise sa propre logique RSI/EMA et place de VRAIS ordres
-// sur la plateforme connectee par l'utilisateur (Kraken, etc).
-// â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• 
-let botRunning = false;
-async function runBotCycle() {
-  if (botRunning) {
-    console.log('[Bot] Cycle precedent encore en cours â€” on attend le prochain');
-    return;
-  }
-  botRunning = true;
-  try {
-    const { execSync } = require('child_process');
-    console.log('[Bot] Lancement du cycle de trading reel...');
-    const output = execSync('node bot.js --once', {
-      encoding: 'utf-8',
-      timeout: 50000,
-      env: process.env
-    });
-    console.log(output);
-  } catch (e) {
-    console.log('[Bot] Erreur cycle:', e.message);
-  } finally {
-    botRunning = false;
-  }
-}
-setTimeout(() => runBotCycle().catch(console.error), 15000);
-setInterval(() => runBotCycle().catch(console.error), SCAN_INTERVAL);
-
-// Cycle Futures â€” execution reelle separee, declenchee aussi chaque minute
-let futuresBotRunning = false;
-async function runFuturesBotCycle() {
-  if (futuresBotRunning) {
-    console.log('[Futures] Cycle precedent encore en cours â€” on attend le prochain');
-    return;
-  }
-  futuresBotRunning = true;
-  try {
-    const { execSync } = require('child_process');
-    console.log('[Futures] Lancement du cycle de trading futures reel...');
-    const output = execSync('node bot-futures.js --once', {
-      encoding: 'utf-8',
-      timeout: 50000,
-      env: process.env
-    });
-    console.log(output);
-  } catch (e) {
-    console.log('[Futures] Erreur cycle:', e.message);
-  } finally {
-    futuresBotRunning = false;
-  }
-}
-setTimeout(() => runFuturesBotCycle().catch(console.error), 25000);
-setInterval(() => runFuturesBotCycle().catch(console.error), SCAN_INTERVAL);
+// Les trades reels sont maintenant executes directement dans scanAll()
+// juste apres la detection des signaux WebSocket — plus besoin de
+// lancer bot.js ou bot-futures.js comme processus separés.
