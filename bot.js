@@ -5,7 +5,16 @@ const mongoose = require('mongoose');
 const COMMISSION_RATE = 0.001; // 0.1%
 const BENDER_WALLET = process.env.BENDER_WALLET;
 const MONGODB_URI = process.env.MONGODB_URI;
-const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
+// Paires analysees: USDC et USD seulement (USDT bloque sur Kraken Canada)
+const SYMBOLS = [
+  'BTC/USDC', 'ETH/USDC', 'SOL/USDC',
+  'BTC/USDC', 'ETH/USDC', 'SOL/USDC',
+  'BTC/USD',  'ETH/USD',  'SOL/USD'
+];
+// LIMITE DE SECURITE CODEE EN DUR — jamais depasser ce montant par trade
+// peu importe ce qui est configure dans le profil utilisateur (protection
+// contre une erreur de configuration ou un montant mal saisi).
+const MAX_TRADE_AMOUNT_USD = 50;
 
 // ── MONGODB ──
 const UserSchema = new mongoose.Schema({
@@ -13,6 +22,7 @@ const UserSchema = new mongoose.Schema({
   exchangeName: String,
   apiKey: String,
   apiSecret: String,
+  tradeAmount: Number,
   active: Boolean
 });
 
@@ -67,11 +77,21 @@ function getSignal(prices) {
   return { signal:'WAIT', confidence:Math.round(conf) };
 }
 
+// Applique la limite de securite codee en dur, peu importe le tradeAmount configure
+function getSafeTradeAmount(requestedAmount) {
+  const amount = Number(requestedAmount) || 0;
+  if (amount <= 0) return 0;
+  return Math.min(amount, MAX_TRADE_AMOUNT_USD);
+}
+
 // ── TRADING RÉEL ──
 async function tradeUser(user) {
   try {
     const ExchangeClass = ccxt[user.exchangeName.toLowerCase()];
-    if (!ExchangeClass) return;
+    if (!ExchangeClass) {
+      console.log('Exchange non supporte:', user.exchangeName);
+      return;
+    }
 
     const exchange = new ExchangeClass({
       apiKey: user.apiKey,
@@ -80,14 +100,39 @@ async function tradeUser(user) {
     });
 
     console.log('Trading pour:', user.email, 'sur', user.exchangeName);
-    const balance = await exchange.fetchBalance();
-    const usdt = balance.USDT?.free || 0;
-    const btcPrice = (await exchange.fetchTicker('BTC/USDT')).last;
 
-    console.log('Balance USDT:', usdt, '| BTC Price: $'+btcPrice);
+    let balance;
+    try {
+      balance = await exchange.fetchBalance();
+    } catch (e) {
+      console.log('Erreur fetchBalance pour', user.email, ':', e.message);
+      return;
+    }
+
+    const usdc = balance.USDC?.free || 0;
+    const usd  = balance.USD?.free  || 0;
+    console.log(`Balance ${user.email} — USDC:${usdc} USD:${usd}`);
+
+    if (usdc + usd <= 0) {
+      console.log('Aucun fonds disponible (USDC/USD) pour', user.email, '— aucun trade possible');
+      return;
+    }
+
+    const safeTradeAmount = getSafeTradeAmount(user.tradeAmount);
+    if (safeTradeAmount <= 0) {
+      console.log('Montant de trade invalide pour', user.email);
+      return;
+    }
+    if (Number(user.tradeAmount) > MAX_TRADE_AMOUNT_USD) {
+      console.log(`Attention: tradeAmount configure (${user.tradeAmount}$) depasse la limite de securite — plafonne a ${MAX_TRADE_AMOUNT_USD}$`);
+    }
 
     for (const symbol of SYMBOLS) {
       try {
+        const [base, quote] = symbol.split('/');
+        // On ne tente le symbole que si l'utilisateur a des fonds dans la devise de cotation
+        const quoteBalance = balance[quote]?.free || 0;
+
         const ohlcv = await exchange.fetchOHLCV(symbol, '1h', undefined, 100);
         const prices = ohlcv.map(c => c[4]);
         const sig = getSignal(prices);
@@ -95,16 +140,16 @@ async function tradeUser(user) {
 
         console.log(symbol, '-', sig.signal, sig.confidence+'%');
 
-        if (sig.signal === 'BUY' && sig.confidence > 65 && usdt >= 10) {
-          // Calculer commission 0.1%
-          const tradeAmount = usdt * 0.3;
-          const commissionUSD = tradeAmount * COMMISSION_RATE;
-          const commissionBTC = commissionUSD / btcPrice;
+        if (sig.signal === 'BUY' && sig.confidence > 65 && quoteBalance >= safeTradeAmount) {
+          const commissionUSD = safeTradeAmount * COMMISSION_RATE;
+          const commissionBTC = commissionUSD / price;
 
-          console.log('Commission:', commissionUSD.toFixed(4), 'USD =', commissionBTC.toFixed(8), 'BTC');
-          console.log('Vers wallet:', BENDER_WALLET);
+          console.log('ORDRE REEL BUY:', symbol, '·', safeTradeAmount, quote, '· Commission:', commissionUSD.toFixed(4));
 
-          // Sauvegarder dans MongoDB
+          // Execution reelle de l'ordre sur la plateforme connectee
+          const order = await exchange.createMarketBuyOrder(symbol, safeTradeAmount / price);
+          console.log('Ordre execute:', order.id);
+
           await new Trade({
             email: user.email,
             type: 'BUY',
@@ -119,13 +164,17 @@ async function tradeUser(user) {
         }
 
         if (sig.signal === 'SELL' && sig.confidence > 65) {
-          const base = symbol.split('/')[0];
           const baseBalance = balance[base]?.free || 0;
 
           if (baseBalance > 0.0001) {
             const tradeValue = baseBalance * price;
             const commissionUSD = tradeValue * COMMISSION_RATE;
-            const commissionBTC = commissionUSD / btcPrice;
+            const commissionBTC = commissionUSD / price;
+
+            console.log('ORDRE REEL SELL:', symbol, '·', baseBalance, base);
+
+            const order = await exchange.createMarketSellOrder(symbol, baseBalance);
+            console.log('Ordre execute:', order.id);
 
             await new Trade({
               email: user.email,
@@ -151,19 +200,12 @@ async function tradeUser(user) {
   }
 }
 
-// ── MAIN ──
-async function main() {
+// ── CYCLE PRINCIPAL ──
+async function runCycle() {
   console.log('=== Bender Pro Bot - Cycle de trading ===');
   console.log('Heure:', new Date().toISOString());
   console.log('Wallet BTC:', BENDER_WALLET);
-
-  if (!MONGODB_URI) {
-    console.log('MONGODB_URI manquant !');
-    return;
-  }
-
-  await mongoose.connect(MONGODB_URI);
-  console.log('MongoDB connecte !');
+  console.log('Limite de securite par trade:', MAX_TRADE_AMOUNT_USD, 'USD');
 
   const users = await User.find({ active: true, apiKey: { $exists: true } });
   console.log('Utilisateurs actifs:', users.length);
@@ -173,7 +215,31 @@ async function main() {
   }
 
   console.log('=== Cycle termine ===');
-  process.exit(0);
+}
+
+// ── MAIN ──
+// Mode boucle: tourne en continu (declenche automatiquement chaque minute).
+// Utiliser `node bot.js --once` pour un seul cycle puis arret (utile pour tester).
+async function main() {
+  if (!MONGODB_URI) {
+    console.log('MONGODB_URI manquant !');
+    process.exit(1);
+  }
+
+  await mongoose.connect(MONGODB_URI);
+  console.log('MongoDB connecte !');
+
+  const runOnce = process.argv.includes('--once');
+
+  if (runOnce) {
+    await runCycle();
+    process.exit(0);
+  } else {
+    await runCycle();
+    setInterval(() => {
+      runCycle().catch(err => console.error('Erreur cycle:', err.message));
+    }, 60 * 1000);
+  }
 }
 
 main().catch(err => {
