@@ -1,4 +1,4 @@
-// Bender Pro v8.0 — Scan via WebSocket Kraken (quasi instantane)
+// Bender Pro v8.0 â€” Scan via WebSocket Kraken (quasi instantane)
 // npm install express cors mongoose ccxt helmet ws
 const express = require('express');
 const cors = require('cors');
@@ -70,7 +70,7 @@ const SignalSchema = new mongoose.Schema({
   time:        { type: Date, default: Date.now }
 });
 
-// Positions ouvertes — suivi TP/SL automatique
+// Positions ouvertes â€” suivi TP/SL automatique
 const OpenPositionSchema = new mongoose.Schema({
   email:       String,
   symbol:      String,
@@ -104,7 +104,7 @@ const FIGURES = [
   { name:'Biseau Baissier',  code:'BisB',  dir:'Long',  wr:0.73 },
 ];
 
-// EXCHANGES (affichage seulement — le scan WebSocket rapide ne couvre que Kraken pour l'instant)
+// EXCHANGES (affichage seulement â€” le scan WebSocket rapide ne couvre que Kraken pour l'instant)
 const EXCHANGES_CONFIG = [
   { id:'kraken',      name:'Kraken',   spot:true,  futures:true  },
   { id:'binance',     name:'Binance',  spot:true,  futures:true  },
@@ -186,12 +186,12 @@ function detectFigure(closes, volumes) {
   return null;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// WEBSOCKET KRAKEN — donnees publiques en continu (sans cle API)
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// WEBSOCKET KRAKEN â€” donnees publiques en continu (sans cle API)
 // On garde en memoire les 50 dernieres bougies 1m de chaque paire,
 // mises a jour en temps reel par le flux WebSocket.
 // Le "scan" devient alors instantane: on lit juste la memoire.
-// ═══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 const krakenCandles = {}; // { 'BTC/USDT': [{o,h,l,c,v}, ...] }
 let krakenPairsList = [];
 let wsConnected = false;
@@ -236,7 +236,7 @@ function connectKrakenWS(pairs) {
 
   ws.on('open', () => {
     wsConnected = true;
-    console.log(`WebSocket Kraken connecte — abonnement a ${pairs.length} paires`);
+    console.log(`WebSocket Kraken connecte â€” abonnement a ${pairs.length} paires`);
     // Kraken limite le nombre de symboles par message d'abonnement;
     // on envoie par lots de 50 pour rester safe
     const CHUNK = 50;
@@ -286,7 +286,7 @@ function connectKrakenWS(pairs) {
 
   ws.on('close', () => {
     wsConnected = false;
-    console.log('WebSocket Kraken deconnecte — reconnexion dans 5s');
+    console.log('WebSocket Kraken deconnecte â€” reconnexion dans 5s');
     setTimeout(() => connectKrakenWS(krakenPairsList), 5000);
   });
 
@@ -295,9 +295,9 @@ function connectKrakenWS(pairs) {
   });
 }
 
-// ── ENTREE IMMEDIATE APRES CASSURE ──
+// â”€â”€ ENTREE IMMEDIATE APRES CASSURE â”€â”€
 // Declenche l'analyse et l'execution du trade des qu'une bougie se ferme
-// sur le WebSocket — pas besoin d'attendre le prochain scan de 60 secondes.
+// sur le WebSocket â€” pas besoin d'attendre le prochain scan de 60 secondes.
 const instantTradeThrottle = {}; // evite les doublons sur la meme paire
 
 async function instantTradeCheck(symbol) {
@@ -316,7 +316,7 @@ async function instantTradeCheck(symbol) {
     if (!sig || sig.dir !== 'Long') return; // Seulement les signaux Long en Spot
 
     const price = closes[closes.length - 1];
-    console.log(`[INSTANT] Signal ${sig.name} detecte sur ${symbol} @ $${price} — entree immediate`);
+    console.log(`[INSTANT] Signal ${sig.name} detecte sur ${symbol} @ $${price} â€” entree immediate`);
 
     // Recupere les utilisateurs actifs sur cette plateforme
     const users = await User.find({ active: true, apiKey: { $exists: true } });
@@ -331,7 +331,7 @@ async function instantTradeCheck(symbol) {
         const amount = Math.min(Math.max(user.tradeAmount || TRADE_AMOUNT, 5), 50);
 
         if (quoteBalance < amount) {
-          console.log(`[INSTANT] Fonds insuffisants pour ${symbol} — ${quoteBalance} ${quote} < ${amount}`);
+          console.log(`[INSTANT] Fonds insuffisants pour ${symbol} â€” ${quoteBalance} ${quote} < ${amount}`);
           continue;
         }
 
@@ -343,7 +343,7 @@ async function instantTradeCheck(symbol) {
         const tpPrice = +(price * (1 + TP_PCT)).toFixed(8);
         const slPrice = +(price * (1 - SL_PCT)).toFixed(8);
 
-        console.log(`[INSTANT] ORDRE BUY: ${symbol} · $${amount} · TP:${tpPrice} · SL:${slPrice}`);
+        console.log(`[INSTANT] ORDRE BUY: ${symbol} Â· $${amount} Â· TP:${tpPrice} Â· SL:${slPrice}`);
         const order = await exchange.createMarketBuyOrder(symbol, qty);
         console.log(`[INSTANT] Ordre execute: ${order.id}`);
 
@@ -396,13 +396,13 @@ async function preloadHistoricalCandles(pairs) {
       await new Promise(r => setTimeout(r, 500));
     }
   }
-  console.log(`Preloading termine — ${loaded}/${pairs.length} paires chargees avec historique`);
+  console.log(`Preloading termine â€” ${loaded}/${pairs.length} paires chargees avec historique`);
 }
 
 async function initKrakenWS() {
   krakenPairsList = await fetchKrakenUsdtPairs();
   if (krakenPairsList.length === 0) {
-    console.log('Aucune paire Kraken trouvee — retry dans 15s');
+    console.log('Aucune paire Kraken trouvee â€” retry dans 15s');
     setTimeout(initKrakenWS, 15000);
     return;
   }
@@ -517,7 +517,7 @@ async function scanExchangeRest(exConfig) {
   return results;
 }
 
-// ── SUIVI AUTOMATIQUE TP/SL DES POSITIONS OUVERTES ──
+// â”€â”€ SUIVI AUTOMATIQUE TP/SL DES POSITIONS OUVERTES â”€â”€
 async function checkOpenPositions(user, exchange) {
   const positions = await OpenPosition.find({ email: user.email });
   if (positions.length === 0) return;
@@ -531,11 +531,11 @@ async function checkOpenPositions(user, exchange) {
       const commissionUSD = pos.amount * COMM_RATE;
 
       if (currentPrice >= pos.tp) {
-        // TP ATTEINT — recupere le vrai solde actuel avant de vendre
+        // TP ATTEINT â€” recupere le vrai solde actuel avant de vendre
         const freshBalance = await exchange.fetchBalance();
         const baseBalance = freshBalance[base]?.free || 0;
         if (baseBalance > 0.000001) {
-          console.log(`[TP/SL] TP ATTEINT ${pos.symbol} — ${currentPrice} >= ${pos.tp} — VENTE`);
+          console.log(`[TP/SL] TP ATTEINT ${pos.symbol} â€” ${currentPrice} >= ${pos.tp} â€” VENTE`);
           const order = await exchange.createMarketSellOrder(pos.symbol, baseBalance);
           console.log(`[TP/SL] Ordre SELL execute: ${order.id}`);
           const pnl = +(pos.amount * TP_PCT - commissionUSD * 2).toFixed(4);
@@ -545,17 +545,17 @@ async function checkOpenPositions(user, exchange) {
             { sort: { time: -1 } }
           );
           await OpenPosition.deleteOne({ _id: pos._id });
-          console.log(`[TP/SL] WIN — PnL: +$${pnl}`);
+          console.log(`[TP/SL] WIN â€” PnL: +$${pnl}`);
         } else {
-          console.log(`[TP/SL] TP atteint mais solde ${base} insuffisant — position deja vendue?`);
+          console.log(`[TP/SL] TP atteint mais solde ${base} insuffisant â€” position deja vendue?`);
           await OpenPosition.deleteOne({ _id: pos._id });
         }
       } else if (currentPrice <= pos.sl) {
-        // SL TOUCHE — recupere le vrai solde actuel avant de vendre
+        // SL TOUCHE â€” recupere le vrai solde actuel avant de vendre
         const freshBalance = await exchange.fetchBalance();
         const baseBalance = freshBalance[base]?.free || 0;
         if (baseBalance > 0.000001) {
-          console.log(`[TP/SL] SL TOUCHE ${pos.symbol} — ${currentPrice} <= ${pos.sl} — VENTE`);
+          console.log(`[TP/SL] SL TOUCHE ${pos.symbol} â€” ${currentPrice} <= ${pos.sl} â€” VENTE`);
           const order = await exchange.createMarketSellOrder(pos.symbol, baseBalance);
           console.log(`[TP/SL] Ordre SELL execute: ${order.id}`);
           const pnl = +(-(pos.amount * SL_PCT + commissionUSD * 2)).toFixed(4);
@@ -565,14 +565,14 @@ async function checkOpenPositions(user, exchange) {
             { sort: { time: -1 } }
           );
           await OpenPosition.deleteOne({ _id: pos._id });
-          console.log(`[TP/SL] LOSS — PnL: $${pnl}`);
+          console.log(`[TP/SL] LOSS â€” PnL: $${pnl}`);
         } else {
-          console.log(`[TP/SL] SL atteint mais solde ${base} insuffisant — position deja vendue?`);
+          console.log(`[TP/SL] SL atteint mais solde ${base} insuffisant â€” position deja vendue?`);
           await OpenPosition.deleteOne({ _id: pos._id });
         }
       } else {
         const pct = ((currentPrice - pos.entryPrice) / pos.entryPrice * 100).toFixed(2);
-        console.log(`[TP/SL] ${pos.symbol}: $${currentPrice} · ${pct >= 0 ? '+' : ''}${pct}% · TP:${pos.tp} SL:${pos.sl}`);
+        console.log(`[TP/SL] ${pos.symbol}: $${currentPrice} Â· ${pct >= 0 ? '+' : ''}${pct}% Â· TP:${pos.tp} SL:${pos.sl}`);
       }
     } catch(e) {
       console.log(`[TP/SL] Erreur ${pos.symbol}:`, e.message);
@@ -583,12 +583,12 @@ async function checkOpenPositions(user, exchange) {
 let scanRunning = false;
 async function scanAll() {
   if (scanRunning) {
-    console.log('Scan precedent encore en cours — on attend le prochain cycle');
+    console.log('Scan precedent encore en cours â€” on attend le prochain cycle');
     return;
   }
   scanRunning = true;
   const startTime = Date.now();
-  console.log(`\n=== SCAN 1m — ${new Date().toLocaleTimeString()} ===`);
+  console.log(`\n=== SCAN 1m â€” ${new Date().toLocaleTimeString()} ===`);
   signalsCache.length = 0;
   Object.keys(signalsByExchange).forEach(k => delete signalsByExchange[k]);
 
@@ -596,18 +596,18 @@ async function scanAll() {
     const users = await User.find({ active:true, apiKey:{$exists:true} });
 
     if (users.length === 0) {
-      console.log('Aucun utilisateur — scan Kraken par defaut (mode test, via WebSocket)');
+      console.log('Aucun utilisateur â€” scan Kraken par defaut (mode test, via WebSocket)');
       const results = scanKrakenFromMemory();
       signalsCache.push(...results);
       signalsByExchange['kraken'] = results;
       lastScanTime = new Date();
-      console.log(`[Kraken-WS] ${krakenPairsList.length} paires en memoire · ${results.length} signal(s)`);
-      console.log(`=== FIN test · ${signalsCache.length} signaux · ${Date.now()-startTime}ms ===\n`);
+      console.log(`[Kraken-WS] ${krakenPairsList.length} paires en memoire Â· ${results.length} signal(s)`);
+      console.log(`=== FIN test Â· ${signalsCache.length} signaux Â· ${Date.now()-startTime}ms ===\n`);
       return;
     }
 
     const uniqueExchanges = [...new Set(users.map(u => u.exchangeName.toLowerCase()))];
-    console.log(`Utilisateurs: ${users.length} · Plateformes: ${uniqueExchanges.join(', ')}`);
+    console.log(`Utilisateurs: ${users.length} Â· Plateformes: ${uniqueExchanges.join(', ')}`);
 
     for (const exchangeId of uniqueExchanges) {
       const exConfig = EXCHANGES_CONFIG.find(e => e.id === exchangeId || e.name.toLowerCase() === exchangeId);
@@ -617,7 +617,7 @@ async function scanAll() {
       if (exConfig.id === 'kraken') {
         // Scan quasi instantane via WebSocket (donnees deja en memoire)
         results = scanKrakenFromMemory();
-        console.log(`[Kraken-WS] ${krakenPairsList.length} paires en memoire · ${results.length} signal(s)`);
+        console.log(`[Kraken-WS] ${krakenPairsList.length} paires en memoire Â· ${results.length} signal(s)`);
       } else {
         // Repli REST plus lent pour les autres plateformes
         results = await scanExchangeRest(exConfig);
@@ -628,9 +628,9 @@ async function scanAll() {
     }
 
     lastScanTime = new Date();
-    console.log(`=== FIN · ${signalsCache.length} signaux · ${Date.now()-startTime}ms ===\n`);
+    console.log(`=== FIN Â· ${signalsCache.length} signaux Â· ${Date.now()-startTime}ms ===\n`);
 
-    // ── EXECUTION REELLE DES TRADES (plus de simulation Math.random) ──
+    // â”€â”€ EXECUTION REELLE DES TRADES (plus de simulation Math.random) â”€â”€
     // On utilise directement les signaux deja detectes par le WebSocket
     // pour placer de vrais ordres sur le compte de chaque utilisateur.
     for (const user of users) {
@@ -671,19 +671,19 @@ async function scanAll() {
             const quoteBalance = balance[quote]?.free || balance['USD']?.free || 0;
             const price         = sig.entryPrice;
 
-            // ── LONG → BUY (seulement si pas deja une position ouverte sur cette paire) ──
+            // â”€â”€ LONG â†’ BUY (seulement si pas deja une position ouverte sur cette paire) â”€â”€
             if (sig.direction === 'Long' && quoteBalance >= amount) {
               // Verifie qu'on n'a pas deja une position ouverte sur cette paire
               const existingPos = await OpenPosition.findOne({ email: user.email, symbol: sig.symbol });
               if (existingPos) {
-                console.log(`[Bot] Position deja ouverte sur ${sig.symbol} — on attend TP/SL`);
+                console.log(`[Bot] Position deja ouverte sur ${sig.symbol} â€” on attend TP/SL`);
                 continue;
               }
               const qty           = amount / price;
               const commissionUSD = amount * COMM_RATE;
               const tpPrice       = +(price * (1 + TP_PCT)).toFixed(8);
               const slPrice       = +(price * (1 - SL_PCT)).toFixed(8);
-              console.log(`[Bot] ORDRE BUY REEL: ${sig.symbol} · ${sig.figure} · $${amount} · TP:${tpPrice} · SL:${slPrice}`);
+              console.log(`[Bot] ORDRE BUY REEL: ${sig.symbol} Â· ${sig.figure} Â· $${amount} Â· TP:${tpPrice} Â· SL:${slPrice}`);
               const order = await exchange.createMarketBuyOrder(sig.symbol, qty);
               console.log(`[Bot] Ordre execute: ${order.id}`);
               // Sauvegarde la position ouverte pour suivi TP/SL
@@ -697,7 +697,7 @@ async function scanAll() {
                 market: sig.market, direction: sig.direction, figure: sig.figure,
                 entryPrice: price, exitPrice: null,
                 amount, pnl: 0, commission: commissionUSD,
-                result: 'OPEN', exitReason: 'Position ouverte — en attente TP/SL'
+                result: 'OPEN', exitReason: 'Position ouverte â€” en attente TP/SL'
               }).save();
               ordersPlaced++;
             }
@@ -709,7 +709,7 @@ async function scanAll() {
 
         if (ordersPlaced > 0) console.log(`[Bot] ${ordersPlaced} ordre(s) place(s) pour ${user.email}`);
 
-        // ── SUIVI TP/SL DES POSITIONS OUVERTES ──
+        // â”€â”€ SUIVI TP/SL DES POSITIONS OUVERTES â”€â”€
         await checkOpenPositions(user, exchange);
 
       } catch(e) {
@@ -724,7 +724,7 @@ async function scanAll() {
 // ROUTES
 app.get('/', (req, res) => res.json({
   status:        'Bender Pro v8.0 actif',
-  strategy:      'Figures chartistes + Volume · Ratio 1:4 · Timeframe 1m',
+  strategy:      'Figures chartistes + Volume Â· Ratio 1:4 Â· Timeframe 1m',
   scanMethod:    'WebSocket Kraken (temps reel) + REST en repli pour autres plateformes',
   tradeAmount:   TRADE_AMOUNT,
   slPct:         SL_PCT*100+'%',
@@ -759,13 +759,13 @@ app.post('/connect', async (req, res) => {
       { apiKey, apiSecret:secret, exchangeName, active:true, tradeAmount:tradeAmount||TRADE_AMOUNT },
       { upsert:true, new:true }
     );
-    res.json({ success:true, message:`Connecte sur ${exchangeName} · $${tradeAmount||TRADE_AMOUNT}/trade · Ratio 1:4 · 1m` });
+    res.json({ success:true, message:`Connecte sur ${exchangeName} Â· $${tradeAmount||TRADE_AMOUNT}/trade Â· Ratio 1:4 Â· 1m` });
   } catch(e) { res.json({ success:false, error:e.message }); }
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// ROUTES FUTURES — systeme separe de Kraken Spot, cle API differente
-// ═══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ROUTES FUTURES â€” systeme separe de Kraken Spot, cle API differente
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 const { FuturesUser, FuturesTrade, MAX_TRADE_AMOUNT_USD: FUTURES_MAX_AMOUNT, MAX_LEVERAGE: FUTURES_MAX_LEVERAGE } = require('./bot-futures');
 
 app.post('/connect-futures', async (req, res) => {
@@ -780,7 +780,7 @@ app.post('/connect-futures', async (req, res) => {
     );
     res.json({
       success:true,
-      message:`Connecte sur Kraken Futures · $${tradeAmount||2}/trade · Levier ${leverage||1}x (max ${FUTURES_MAX_LEVERAGE}x)`
+      message:`Connecte sur Kraken Futures Â· $${tradeAmount||2}/trade Â· Levier ${leverage||1}x (max ${FUTURES_MAX_LEVERAGE}x)`
     });
   } catch(e) { res.json({ success:false, error:e.message }); }
 });
@@ -899,7 +899,7 @@ app.get('/platform-signals/:email', async (req, res) => {
   });
 });
 
-// Route temporaire pour vider tous les utilisateurs — a supprimer apres usage
+// Route temporaire pour vider tous les utilisateurs â€” a supprimer apres usage
 app.get('/clear-users', async (req, res) => {
   try {
     const result = await User.deleteMany({});
@@ -938,23 +938,41 @@ app.post('/toggle', async (req, res) => {
 // DEMARRAGE
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\n Bender Pro v8.0 · Port ${PORT}`);
-  console.log(` Figures chartistes + Volume · Ratio 1:4 · 1m`);
+  console.log(`\n Bender Pro v8.0 Â· Port ${PORT}`);
+  console.log(` Figures chartistes + Volume Â· Ratio 1:4 Â· 1m`);
   console.log(` Scan Kraken via WebSocket (quasi instantane)`);
-  console.log(` Helmet actif · Securite HTTP headers`);
-  console.log(` $${TRADE_AMOUNT}/trade · SL -1% · TP +4%`);
+  console.log(` Helmet actif Â· Securite HTTP headers`);
+  console.log(` $${TRADE_AMOUNT}/trade Â· SL -1% Â· TP +4%`);
   console.log(` Scan toutes les 60 secondes\n`);
-  // Le port est ouvert immediatement — Render peut maintenant joindre le serveur.
-  // Le preloading et le WebSocket demarrent en arriere-plan sans bloquer le port.
   setImmediate(() => {
     initKrakenWS().then(() => {
-      // Demarre le scan seulement apres que le preloading soit termine
       setTimeout(() => scanAll().catch(console.error), 5000);
       setInterval(() => scanAll().catch(console.error), SCAN_INTERVAL);
     }).catch(console.error);
   });
+
+  // â”€â”€ SUIVI TP/SL TOUTES LES 30 SECONDES â”€â”€
+  // Completement independant du scan â€” surveille les positions
+  // ouvertes par instantTradeCheck et les ferme au TP ou SL.
+  setInterval(async () => {
+    try {
+      const users = await User.find({ active: true, apiKey: { $exists: true } });
+      for (const user of users) {
+        const count = await OpenPosition.countDocuments({ email: user.email });
+        if (count === 0) continue;
+        const ExClass = ccxt[user.exchangeName.toLowerCase()];
+        if (!ExClass) continue;
+        const exchange = new ExClass({
+          apiKey: user.apiKey, secret: user.apiSecret, enableRateLimit: true
+        });
+        await checkOpenPositions(user, exchange);
+      }
+    } catch(e) {
+      console.log('[TP/SL Monitor] Erreur:', e.message);
+    }
+  }, 30000);
 });
 
 // Les trades reels sont maintenant executes directement dans scanAll()
-// juste apres la detection des signaux WebSocket — plus besoin de
-// lancer bot.js ou bot-futures.js comme processus separés.
+// juste apres la detection des signaux WebSocket â€” plus besoin de
+// lancer bot.js ou bot-futures.js comme processus separÃ©s.
