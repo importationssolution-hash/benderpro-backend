@@ -74,8 +74,8 @@ const OpenPositionSchema = new mongoose.Schema({
   exchange:    String,
   figure:      String,
   entryPrice:  Number,
-  tp:          Number,   // prix cible +2%
-  sl:          Number,   // prix stop -0.5%
+  tp:          Number,   // prix cible +4%
+  sl:          Number,   // prix stop -1%
   qty:         Number,   // quantite achetee
   amount:      Number,   // montant en USD
   openedAt:    { type: Date, default: Date.now }
@@ -442,7 +442,7 @@ async function scanExchangeRest(exConfig) {
           const volumes = ohlcv.map(c => c[5]);
           const price   = closes[closes.length-1];
           const market  = markets[symbol].type;
-          const sig = detectFigure(closes, volumes);
+          const sig = detectFigure(closes, volumes, price);
           if (!sig) return null;
           const volRatio = volumes[volumes.length-1] / avg(volumes.slice(-20));
           return {
@@ -694,9 +694,7 @@ async function scanAll() {
         }
 
         if (ordersPlaced > 0) console.log(`[Bot] ${ordersPlaced} ordre(s) place(s) pour ${user.email}`);
-
-        // â”€â”€ SUIVI TP/SL DES POSITIONS OUVERTES â”€â”€
-        await checkOpenPositions(user, exchange, balance);
+        // Suivi TP/SL gere par checkTPSLInstant (toutes les 2s) â€” plus besoin ici
 
       } catch(e) {
         console.log(`[Bot] Erreur utilisateur ${user.email}:`, e.message);
