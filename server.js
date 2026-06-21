@@ -18,7 +18,7 @@ const SL_PCT         = 0.01;   // -1%
 const TP_PCT         = 0.04;   // +4%
 const MAX_CONCURRENT = 20;
 const VOL_CONFIRM    = 1.8;
-const SCAN_INTERVAL  = 60 * 1000;
+const SCAN_INTERVAL  = 60 * 1000; // scan toutes les 60s (bougies 1h)
 const MAX_PAIRS      = 500;
 
 // MONGODB
@@ -275,7 +275,7 @@ function connectKrakenWS(pairs) {
         params: {
           channel: 'ohlc',
           symbol: chunk,
-          interval: 1
+          interval: 60
         }
       }));
     }
@@ -328,7 +328,7 @@ async function preloadHistoricalCandles(pairs) {
     const batch = pairs.slice(i, i + BATCH);
     await Promise.all(batch.map(async (symbol) => {
       try {
-        const ohlcv = await exchange.fetchOHLCV(symbol, '1m', undefined, 55);
+        const ohlcv = await exchange.fetchOHLCV(symbol, '1h', undefined, 55);
         if (!ohlcv || ohlcv.length < 10) return;
         krakenCandles[symbol] = ohlcv.map(c => ({
           t: String(c[0]),
@@ -379,7 +379,7 @@ function scanKrakenFromMemory() {
       symbol,
       exchange:    'Kraken',
       exchangeId:  'kraken',
-      timeframe:   '1m',
+      timeframe:   '1h',
       market:      'Spot',
       figure:      sig.fig.name,
       figureCode:  sig.fig.code,
@@ -400,7 +400,7 @@ function scanKrakenFromMemory() {
       symbol, exchange:'Kraken', market:'Spot',
       figure:sig.fig.name, direction:sig.fig.dir,
       confidence:signal.confidence, entryPrice:price,
-      tp:sig.tp, sl:sig.sl, volumeRatio:volRatio, timeframe:'1m'
+      tp:sig.tp, sl:sig.sl, volumeRatio:volRatio, timeframe:'1h'
     }).save().catch(()=>{});
   }
   return results;
@@ -436,7 +436,7 @@ async function scanExchangeRest(exConfig) {
       const batch = symbols.slice(i, i + BATCH);
       const batchResults = await Promise.all(batch.map(async (symbol) => {
         try {
-          const ohlcv = await exchange.fetchOHLCV(symbol, '1m', undefined, 50);
+          const ohlcv = await exchange.fetchOHLCV(symbol, '1h', undefined, 50);
           if (!ohlcv || ohlcv.length < 20) return null;
           const closes  = ohlcv.map(c => c[4]);
           const volumes = ohlcv.map(c => c[5]);
@@ -576,7 +576,7 @@ async function scanAll() {
   }
   scanRunning = true;
   const startTime = Date.now();
-  console.log(`\n=== SCAN 1m â€” ${new Date().toLocaleTimeString()} ===`);
+  console.log(`\n=== SCAN 1h â€” ${new Date().toLocaleTimeString()} ===`);
   signalsCache.length = 0;
   Object.keys(signalsByExchange).forEach(k => delete signalsByExchange[k]);
 
@@ -742,7 +742,7 @@ app.post('/connect', async (req, res) => {
       { apiKey, apiSecret:secret, exchangeName, active:true, tradeAmount:tradeAmount||TRADE_AMOUNT },
       { upsert:true, new:true }
     );
-    res.json({ success:true, message:`Connecte sur ${exchangeName} Â· $${tradeAmount||TRADE_AMOUNT}/trade Â· Ratio 1:4 Â· 1m` });
+    res.json({ success:true, message:`Connecte sur ${exchangeName} Â· $${tradeAmount||TRADE_AMOUNT}/trade Â· Ratio 1:4 Â· 1h` });
   } catch(e) { res.json({ success:false, error:e.message }); }
 });
 
@@ -915,11 +915,11 @@ app.post('/toggle', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n Bender Pro v8.0 Â· Port ${PORT}`);
-  console.log(` Figures chartistes + Volume Â· Ratio 1:4 Â· 1m`);
+  console.log(` Figures chartistes + Volume Â· Ratio 1:4 Â· 1h`);
   console.log(` Scan Kraken via WebSocket (quasi instantane)`);
   console.log(` Helmet actif Â· Securite HTTP headers`);
   console.log(` $${TRADE_AMOUNT}/trade Â· SL -1% Â· TP +4% Â· Ratio 4:1`);
-  console.log(` Scan toutes les 60 secondes\n`);
+  console.log(` Scan toutes les 60 secondes (bougies 1h)\n`);
   setImmediate(() => {
     initKrakenWS().then(() => {
       setTimeout(() => scanAll().catch(console.error), 5000);
