@@ -230,6 +230,39 @@ async function fetchKrakenUsdtPairs() {
   }
 }
 
+// Prix live par paire â€” mis a jour par le ticker WebSocket (tick par tick)
+// Utilise pour le suivi TP/SL instantane â€” plus precis que le close de bougie 30m
+const livePrices = {}; // { 'BTC/USD': 105234.50 }
+let wsTicker = null;
+
+function connectKrakenTicker(pairs) {
+  if (wsTicker) { try { wsTicker.terminate(); } catch(e) {} }
+  wsTicker = new WebSocket('wss://ws.kraken.com/v2');
+  wsTicker.on('open', () => {
+    console.log(`[Ticker] WebSocket prix live connecte â€” ${pairs.length} paires`);
+    const CHUNK = 50;
+    for (let i = 0; i < pairs.length; i += CHUNK) {
+      const chunk = pairs.slice(i, i + CHUNK);
+      wsTicker.send(JSON.stringify({ method: 'subscribe', params: { channel: 'ticker', symbol: chunk } }));
+    }
+  });
+  wsTicker.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw);
+      if (msg.channel === 'ticker' && msg.data) {
+        for (const t of msg.data) {
+          if (t.symbol && t.last) livePrices[t.symbol] = t.last;
+        }
+      }
+    } catch(e) {}
+  });
+  wsTicker.on('close', () => {
+    console.log('[Ticker] Deconnecte â€” reconnexion dans 5s');
+    setTimeout(() => connectKrakenTicker(krakenPairsList), 5000);
+  });
+  wsTicker.on('error', (err) => { console.log('[Ticker] Erreur:', err.message); });
+}
+
 function connectKrakenWS(pairs) {
   if (ws) {
     try { ws.terminate(); } catch(e) {}
@@ -331,6 +364,7 @@ async function initKrakenWS() {
   // Precharge les bougies historiques avant de connecter le WebSocket
   await preloadHistoricalCandles(krakenPairsList);
   connectKrakenWS(krakenPairsList);
+  connectKrakenTicker(krakenPairsList); // ticker prix live pour TP/SL instantane
 }
 
 // Scan instantane: lit les bougies deja en memoire (mises a jour par le WebSocket)
@@ -505,9 +539,9 @@ async function checkTPSLInstant() {
     const positions = await OpenPosition.find({});
     if (positions.length === 0) return;
     for (const pos of positions) {
-      const candles = krakenCandles[pos.symbol];
-      if (!candles || candles.length === 0) continue;
-      const currentPrice = candles[candles.length - 1].c;
+      // Prix tick par tick depuis le ticker WebSocket â€” pas le close de bougie 30m
+      const currentPrice = livePrices[pos.symbol];
+      if (!currentPrice) continue; // ticker pas encore recu pour cette paire
       if (!currentPrice) continue;
       const hitTP = currentPrice >= pos.tp;
       const hitSL = currentPrice <= pos.sl;
