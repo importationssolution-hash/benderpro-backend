@@ -18,7 +18,7 @@ const SL_PCT         = 0.01;   // -1%
 const TP_PCT         = 0.04;   // +4%
 const MAX_CONCURRENT = 20;
 const VOL_CONFIRM    = 1.8;
-const SCAN_INTERVAL  = 60 * 1000; // scan toutes les 60s (bougies 1h)
+const SCAN_INTERVAL  = 60 * 1000; // scan toutes les 60s (bougies 5m)
 const MAX_PAIRS      = 500;
 
 // MONGODB
@@ -125,13 +125,13 @@ const marketsCache = {};
 
 function avg(arr) { return arr.reduce((a,b)=>a+b,0)/arr.length; }
 
-// detectFigure â€” entre a la CASSURE en temps reel (bougie live WebSocket)
-// On utilise le prix live (derniere bougie en cours, pas encore fermee)
-// pour entrer des que le niveau cle est casse, sans attendre confirmation.
+// detectFigure â€” TP/SL DYNAMIQUES bases sur la geometrie de la figure
+// TP = projection de la hauteur de la figure depuis le point de cassure
+// SL = sous/sur le niveau technique naturel de la figure
+// Timeframe: 1D (bougies journalieres)
 function detectFigure(closes, volumes, livePrice) {
   if (closes.length < 20) return null;
   const n = closes.length;
-  // Prix d'entree = prix live si disponible, sinon dernier close
   const price = livePrice || closes[n-1];
   const volNow = volumes[n-1];
   const volAvg = avg(volumes.slice(-20));
@@ -143,73 +143,90 @@ function detectFigure(closes, volumes, livePrice) {
   const figH = h - l;
   const range = figH / price;
   const trend10 = (price - closes[n-11]) / closes[n-11];
+  // Filtre: figure trop petite â€” TP insuffisant pour couvrir les frais (0.80%x2=1.6%)
+  // On exige minimum 3% de hauteur pour garantir un gain net positif
+  if (range < 0.03) return null;
 
-  // â”€â”€ Cup & Handle â”€â”€
-  // Cassure: le prix live depasse le niveau de resistance (bord droit de la coupe)
+
+  // Cup & Handle: TP = cassure + hauteur coupe / SL = sous bas du handle
   if (n >= 15) {
     const midLow = Math.min(...closes.slice(n-12, n-4));
-    const resistance = Math.max(...closes.slice(n-6, n-1)); // niveau a casser
+    const resistance = Math.max(...closes.slice(n-6, n-1));
+    const handleLow = Math.min(...closes.slice(n-5, n-1));
     if (midLow < closes[n-14]*0.95 && price > resistance && volRatio > 1.8)
-      return { fig:FIGURES[0], tp:price+figH, sl:price*(1-SL_PCT) };
+      return { fig:FIGURES[0], tp:+(price+figH).toFixed(8), sl:+(handleLow*0.995).toFixed(8),
+        tpPct:((figH/price)*100).toFixed(2), slPct:(((price-handleLow*0.995)/price)*100).toFixed(2) };
   }
-  // â”€â”€ ETE (Epaule-Tete-Epaule) â”€â”€
-  // Cassure: le prix live passe sous la ligne de cou (neckline)
+  // ETE: TP = neckline - hauteur tete / SL = au-dessus epaule droite
   if (n >= 15) {
     const head = Math.max(...closes.slice(n-12, n-4));
     const sh = Math.max(...closes.slice(n-14, n-10));
-    const neckline = Math.min(...closes.slice(n-12, n-2)); // ligne de cou
+    const neckline = Math.min(...closes.slice(n-12, n-2));
+    const epaule = Math.max(...closes.slice(n-5, n-1));
     if (head>sh*1.02 && head>closes[n-2]*1.02 && price < neckline && volRatio>1.5)
-      return { fig:FIGURES[1], tp:price-figH*0.85, sl:price*(1+SL_PCT) };
+      return { fig:FIGURES[1], tp:+(price-(head-neckline)).toFixed(8), sl:+(epaule*1.005).toFixed(8),
+        tpPct:(((head-neckline)/price)*100).toFixed(2), slPct:(((epaule*1.005-price)/price)*100).toFixed(2) };
   }
-  // â”€â”€ ETE Inverse â”€â”€
-  // Cassure: le prix live passe au-dessus de la ligne de cou
+  // ETE Inverse: TP = neckline + hauteur tete / SL = sous epaule droite
   if (n >= 15) {
     const headL = Math.min(...closes.slice(n-12, n-4));
     const shL = Math.min(...closes.slice(n-14, n-10));
-    const necklineL = Math.max(...closes.slice(n-12, n-2)); // ligne de cou
+    const necklineL = Math.max(...closes.slice(n-12, n-2));
+    const epauleL = Math.min(...closes.slice(n-5, n-1));
     if (headL<shL*0.98 && headL<closes[n-2]*0.98 && price > necklineL && volRatio>1.5)
-      return { fig:FIGURES[2], tp:price+figH*0.85, sl:price*(1-SL_PCT) };
+      return { fig:FIGURES[2], tp:+(price+(necklineL-headL)).toFixed(8), sl:+(epauleL*0.995).toFixed(8),
+        tpPct:(((necklineL-headL)/price)*100).toFixed(2), slPct:(((price-epauleL*0.995)/price)*100).toFixed(2) };
   }
-  // â”€â”€ Double Top â”€â”€
-  // Cassure: le prix live passe sous le creux entre les deux sommets
+  // Double Top: TP = creux - distance sommet-creux / SL = au-dessus des tops
   if (n >= 10) {
     const mx1=Math.max(...closes.slice(n-10,n-5)), mx2=Math.max(...closes.slice(n-5,n));
-    const creux = Math.min(...closes.slice(n-8, n-2)); // support a casser
+    const creux = Math.min(...closes.slice(n-8, n-2));
+    const topLevel = Math.max(mx1, mx2);
     if (Math.abs(mx1-mx2)/mx1<0.015 && price < creux && volRatio>1.4)
-      return { fig:FIGURES[3], tp:price-figH*0.9, sl:price*(1+SL_PCT) };
+      return { fig:FIGURES[3], tp:+(price-(topLevel-creux)).toFixed(8), sl:+(topLevel*1.005).toFixed(8),
+        tpPct:(((topLevel-creux)/price)*100).toFixed(2), slPct:(((topLevel*1.005-price)/price)*100).toFixed(2) };
   }
-  // â”€â”€ Double Bottom â”€â”€
-  // Cassure: le prix live passe au-dessus du sommet entre les deux creux
+  // Double Bottom: TP = sommet + distance sommet-creux / SL = sous les creux
   if (n >= 10) {
     const mn1=Math.min(...closes.slice(n-10,n-5)), mn2=Math.min(...closes.slice(n-5,n));
-    const sommet = Math.max(...closes.slice(n-8, n-2)); // resistance a casser
+    const sommet = Math.max(...closes.slice(n-8, n-2));
+    const botLevel = Math.min(mn1, mn2);
     if (Math.abs(mn1-mn2)/mn1<0.015 && price > sommet && volRatio>1.4)
-      return { fig:FIGURES[4], tp:price+figH*0.9, sl:price*(1-SL_PCT) };
+      return { fig:FIGURES[4], tp:+(price+(sommet-botLevel)).toFixed(8), sl:+(botLevel*0.995).toFixed(8),
+        tpPct:(((sommet-botLevel)/price)*100).toFixed(2), slPct:(((price-botLevel*0.995)/price)*100).toFixed(2) };
   }
-  // â”€â”€ Triangle Ascendant â”€â”€
-  // Cassure: prix live depasse la resistance horizontale haute
-  if (range<0.04 && trend10>0.01 && price > h*0.999 && volRatio>1.6)
-    return { fig:FIGURES[5], tp:price+figH*0.8, sl:price*(1-SL_PCT) };
-  // â”€â”€ Triangle Descendant â”€â”€
-  // Cassure: prix live passe sous le support horizontal bas
-  if (range<0.04 && trend10<-0.01 && price < l*1.001 && volRatio>1.6)
-    return { fig:FIGURES[6], tp:price-figH*0.8, sl:price*(1+SL_PCT) };
-  // â”€â”€ Drapeau Haussier â”€â”€
-  // Cassure: prix live sort par le haut du canal de consolidation
-  if (trend10>0.06 && range<0.025 && price > h*0.999 && volRatio>1.8)
-    return { fig:FIGURES[7], tp:price+figH, sl:price*(1-SL_PCT) };
-  // â”€â”€ Drapeau Baissier â”€â”€
-  // Cassure: prix live sort par le bas du canal de consolidation
-  if (trend10<-0.06 && range<0.025 && price < l*1.001 && volRatio>1.8)
-    return { fig:FIGURES[8], tp:price-figH, sl:price*(1+SL_PCT) };
-  // â”€â”€ Biseau Haussier (bearish) â”€â”€
-  // Cassure: prix live casse le support du biseau par le bas
+  // Triangle Ascendant: TP = resistance + hauteur / SL = sous dernier creux
+  if (range<0.04 && trend10>0.01 && price > h*0.999 && volRatio>1.6) {
+    const lastLow = Math.min(...closes.slice(n-5, n-1));
+    return { fig:FIGURES[5], tp:+(price+figH*0.8).toFixed(8), sl:+(lastLow*0.995).toFixed(8),
+      tpPct:((figH*0.8/price)*100).toFixed(2), slPct:(((price-lastLow*0.995)/price)*100).toFixed(2) };
+  }
+  // Triangle Descendant: TP = support - hauteur / SL = au-dessus dernier sommet
+  if (range<0.04 && trend10<-0.01 && price < l*1.001 && volRatio>1.6) {
+    const lastHigh = Math.max(...closes.slice(n-5, n-1));
+    return { fig:FIGURES[6], tp:+(price-figH*0.8).toFixed(8), sl:+(lastHigh*1.005).toFixed(8),
+      tpPct:((figH*0.8/price)*100).toFixed(2), slPct:(((lastHigh*1.005-price)/price)*100).toFixed(2) };
+  }
+  // Drapeau Haussier: TP = mat projete / SL = sous bas du canal
+  if (trend10>0.06 && range<0.025 && price > h*0.999 && volRatio>1.8) {
+    const flagLow = Math.min(...closes.slice(n-6, n-1));
+    return { fig:FIGURES[7], tp:+(price+figH).toFixed(8), sl:+(flagLow*0.995).toFixed(8),
+      tpPct:((figH/price)*100).toFixed(2), slPct:(((price-flagLow*0.995)/price)*100).toFixed(2) };
+  }
+  // Drapeau Baissier: TP = mat projete vers bas / SL = au-dessus haut du canal
+  if (trend10<-0.06 && range<0.025 && price < l*1.001 && volRatio>1.8) {
+    const flagHigh = Math.max(...closes.slice(n-6, n-1));
+    return { fig:FIGURES[8], tp:+(price-figH).toFixed(8), sl:+(flagHigh*1.005).toFixed(8),
+      tpPct:((figH/price)*100).toFixed(2), slPct:(((flagHigh*1.005-price)/price)*100).toFixed(2) };
+  }
+  // Biseau Haussier (bearish): SL = au-dessus du haut du biseau
   if (range<0.035 && trend10>0.02 && trend10<0.05 && price < l*1.001 && volRatio>1.7)
-    return { fig:FIGURES[9], tp:price-figH*0.75, sl:price*(1+SL_PCT) };
-  // â”€â”€ Biseau Baissier (bullish) â”€â”€
-  // Cassure: prix live casse la resistance du biseau par le haut
+    return { fig:FIGURES[9], tp:+(price-figH*0.75).toFixed(8), sl:+(h*1.005).toFixed(8),
+      tpPct:((figH*0.75/price)*100).toFixed(2), slPct:(((h*1.005-price)/price)*100).toFixed(2) };
+  // Biseau Baissier (bullish): SL = sous le bas du biseau
   if (range<0.035 && trend10<-0.02 && trend10>-0.05 && price > h*0.999 && volRatio>1.7)
-    return { fig:FIGURES[10], tp:price+figH*0.75, sl:price*(1-SL_PCT) };
+    return { fig:FIGURES[10], tp:+(price+figH*0.75).toFixed(8), sl:+(l*0.995).toFixed(8),
+      tpPct:((figH*0.75/price)*100).toFixed(2), slPct:(((price-l*0.995)/price)*100).toFixed(2) };
 
   return null;
 }
@@ -275,7 +292,7 @@ function connectKrakenWS(pairs) {
         params: {
           channel: 'ohlc',
           symbol: chunk,
-          interval: 60
+          interval: 1440
         }
       }));
     }
@@ -328,7 +345,7 @@ async function preloadHistoricalCandles(pairs) {
     const batch = pairs.slice(i, i + BATCH);
     await Promise.all(batch.map(async (symbol) => {
       try {
-        const ohlcv = await exchange.fetchOHLCV(symbol, '1h', undefined, 55);
+        const ohlcv = await exchange.fetchOHLCV(symbol, '1d', undefined, 55);
         if (!ohlcv || ohlcv.length < 10) return;
         krakenCandles[symbol] = ohlcv.map(c => ({
           t: String(c[0]),
@@ -379,7 +396,7 @@ function scanKrakenFromMemory() {
       symbol,
       exchange:    'Kraken',
       exchangeId:  'kraken',
-      timeframe:   '1h',
+      timeframe:   '1d',
       market:      'Spot',
       figure:      sig.fig.name,
       figureCode:  sig.fig.code,
@@ -400,7 +417,7 @@ function scanKrakenFromMemory() {
       symbol, exchange:'Kraken', market:'Spot',
       figure:sig.fig.name, direction:sig.fig.dir,
       confidence:signal.confidence, entryPrice:price,
-      tp:sig.tp, sl:sig.sl, volumeRatio:volRatio, timeframe:'1h'
+      tp:sig.tp, sl:sig.sl, volumeRatio:volRatio, timeframe:'1d'
     }).save().catch(()=>{});
   }
   return results;
@@ -436,7 +453,7 @@ async function scanExchangeRest(exConfig) {
       const batch = symbols.slice(i, i + BATCH);
       const batchResults = await Promise.all(batch.map(async (symbol) => {
         try {
-          const ohlcv = await exchange.fetchOHLCV(symbol, '1h', undefined, 50);
+          const ohlcv = await exchange.fetchOHLCV(symbol, '1d', undefined, 50);
           if (!ohlcv || ohlcv.length < 20) return null;
           const closes  = ohlcv.map(c => c[4]);
           const volumes = ohlcv.map(c => c[5]);
@@ -446,7 +463,7 @@ async function scanExchangeRest(exConfig) {
           if (!sig) return null;
           const volRatio = volumes[volumes.length-1] / avg(volumes.slice(-20));
           return {
-            symbol, exchange: exConfig.name, exchangeId: exConfig.id, timeframe: '1m',
+            symbol, exchange: exConfig.name, exchangeId: exConfig.id, timeframe: '5m',
             market: market === 'spot' ? 'Spot' : 'Futures',
             figure: sig.fig.name, figureCode: sig.fig.code, direction: sig.fig.dir,
             confidence: Math.round(sig.fig.wr * 100), entryPrice: price,
@@ -576,7 +593,7 @@ async function scanAll() {
   }
   scanRunning = true;
   const startTime = Date.now();
-  console.log(`\n=== SCAN 1h â€” ${new Date().toLocaleTimeString()} ===`);
+  console.log(`\n=== SCAN 1D â€” ${new Date().toLocaleTimeString()} ===`);
   signalsCache.length = 0;
   Object.keys(signalsByExchange).forEach(k => delete signalsByExchange[k]);
 
@@ -742,7 +759,7 @@ app.post('/connect', async (req, res) => {
       { apiKey, apiSecret:secret, exchangeName, active:true, tradeAmount:tradeAmount||TRADE_AMOUNT },
       { upsert:true, new:true }
     );
-    res.json({ success:true, message:`Connecte sur ${exchangeName} Â· $${tradeAmount||TRADE_AMOUNT}/trade Â· Ratio 1:4 Â· 1h` });
+    res.json({ success:true, message:`Connecte sur ${exchangeName} Â· $${tradeAmount||TRADE_AMOUNT}/trade Â· TP/SL Dynamiques Â· 1D` });
   } catch(e) { res.json({ success:false, error:e.message }); }
 });
 
@@ -915,11 +932,11 @@ app.post('/toggle', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n Bender Pro v8.0 Â· Port ${PORT}`);
-  console.log(` Figures chartistes + Volume Â· Ratio 1:4 Â· 1h`);
+  console.log(` Figures chartistes + Volume Â· TP/SL Dynamiques Â· 1D`);
   console.log(` Scan Kraken via WebSocket (quasi instantane)`);
   console.log(` Helmet actif Â· Securite HTTP headers`);
   console.log(` $${TRADE_AMOUNT}/trade Â· SL -1% Â· TP +4% Â· Ratio 4:1`);
-  console.log(` Scan toutes les 60 secondes (bougies 1h)\n`);
+  console.log(` Scan toutes les 60 secondes (bougies 1D)\n`);
   setImmediate(() => {
     initKrakenWS().then(() => {
       setTimeout(() => scanAll().catch(console.error), 5000);
