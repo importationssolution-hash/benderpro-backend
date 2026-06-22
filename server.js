@@ -15,10 +15,10 @@ app.use(express.json());
 // CONFIG
 const TRADE_AMOUNT   = 5; // Minimum 5 USD par trade
 const SL_PCT         = 0.01;   // -1%
-const TP_PCT         = 0.052;  // +5.2% (SL 1% + frais 1.6% x2 = ratio 2:1)
+const TP_PCT         = 0.17;   // +17%
 const MAX_CONCURRENT = 20;
 const VOL_CONFIRM    = 1.8;
-const SCAN_INTERVAL  = 60 * 1000; // scan toutes les 60s (bougies 5m)
+const SCAN_INTERVAL  = 60 * 1000; // scan toutes les 60s (bougies 1D)
 const MAX_PAIRS      = 500;
 
 // MONGODB
@@ -128,19 +128,19 @@ function avg(arr) { return arr.reduce((a,b)=>a+b,0)/arr.length; }
 // detectFigure â€” TP/SL FIXES Â· Entree a la cassure de resistance
 // TP = +5.2% fixe / SL = -1% fixe / Filtre = 20% hauteur minimum
 function detectFigure(closes, volumes, livePrice) {
-  if (closes.length < 20) return null;
+  if (closes.length < 100) return null; // minimum 100 bougies Daily
   const n = closes.length;
   const price = livePrice || closes[n-1];
   const volNow = volumes[n-1];
-  const volAvg = avg(volumes.slice(-20));
+  const volAvg = avg(volumes.slice(-50)); // moyenne volume sur 50 jours
   const volRatio = volNow / volAvg;
   if (volRatio < VOL_CONFIRM) return null;
 
-  const slice = closes.slice(-20);
+  const slice = closes.slice(-150); // fenetre 150 bougies Daily (5 mois)
   const h = Math.max(...slice), l = Math.min(...slice);
   const figH = h - l;
   const range = figH / price;
-  const trend10 = (price - closes[n-11]) / closes[n-11];
+  const trend10 = (price - closes[n-51]) / closes[n-51];
 
   // Filtre: figure minimum 20% de hauteur
   if (range < 0.20) return null;
@@ -149,26 +149,26 @@ function detectFigure(closes, volumes, livePrice) {
   const sl = +(price * (1 - SL_PCT)).toFixed(8);
 
   // Cup & Handle â€” entree des que resistance franchie
-  if (n >= 15) {
-    const midLow = Math.min(...closes.slice(n-12, n-4));
-    const resistance = Math.max(...closes.slice(n-6, n-1));
-    if (midLow < closes[n-14]*0.95 && price > resistance && volRatio > 1.8)
+  if (n >= 100) {
+    const midLow = Math.min(...closes.slice(n-60, n-20));
+    const resistance = Math.max(...closes.slice(n-30, n-1));
+    if (midLow < closes[n-70]*0.95 && price > resistance && volRatio > 1.8)
       return { fig:FIGURES[0], tp, sl };
   }
   // ETE retire (Short â€” Spot Long seulement)
   // ETE Inverse â€” entree des que neckline cassee a la hausse
-  if (n >= 15) {
-    const headL = Math.min(...closes.slice(n-12, n-4));
-    const shL = Math.min(...closes.slice(n-14, n-10));
-    const necklineL = Math.max(...closes.slice(n-12, n-2));
+  if (n >= 100) {
+    const headL = Math.min(...closes.slice(n-60, n-20));
+    const shL = Math.min(...closes.slice(n-70, n-50));
+    const necklineL = Math.max(...closes.slice(n-60, n-2));
     if (headL<shL*0.98 && headL<closes[n-2]*0.98 && price > necklineL && volRatio>1.5)
       return { fig:FIGURES[2], tp, sl };
   }
   // Double Top retire (Short â€” Spot Long seulement)
   // Double Bottom â€” entree des que resistance cassee
-  if (n >= 10) {
-    const mn1=Math.min(...closes.slice(n-10,n-5)), mn2=Math.min(...closes.slice(n-5,n));
-    const sommet = Math.max(...closes.slice(n-8, n-2));
+  if (n >= 70) {
+    const mn1=Math.min(...closes.slice(n-50,n-25)), mn2=Math.min(...closes.slice(n-25,n));
+    const sommet = Math.max(...closes.slice(n-40, n-2));
     if (Math.abs(mn1-mn2)/mn1<0.015 && price > sommet && volRatio>1.4)
       return { fig:FIGURES[4], tp, sl };
   }
@@ -282,7 +282,7 @@ function connectKrakenWS(pairs) {
         params: {
           channel: 'ohlc',
           symbol: chunk,
-          interval: 30
+          interval: 1440
         }
       }));
     }
@@ -327,7 +327,7 @@ function connectKrakenWS(pairs) {
 // Precharge les 50 dernieres bougies historiques via REST au demarrage
 // pour ne pas attendre 50 minutes que le WebSocket les accumule.
 async function preloadHistoricalCandles(pairs) {
-  console.log(`Preloading ${pairs.length} paires via REST (bougies historiques)...`);
+  console.log(`Preloading ${pairs.length} paires via REST (160 bougies Daily historiques)...`);
   const exchange = new ccxt.kraken({ enableRateLimit: true, timeout: 10000 });
   const BATCH = 50; // Batches plus grands pour aller plus vite
   let loaded = 0;
@@ -335,7 +335,7 @@ async function preloadHistoricalCandles(pairs) {
     const batch = pairs.slice(i, i + BATCH);
     await Promise.all(batch.map(async (symbol) => {
       try {
-        const ohlcv = await exchange.fetchOHLCV(symbol, '30m', undefined, 55);
+        const ohlcv = await exchange.fetchOHLCV(symbol, '1d', undefined, 160);
         if (!ohlcv || ohlcv.length < 10) return;
         krakenCandles[symbol] = ohlcv.map(c => ({
           t: String(c[0]),
@@ -382,12 +382,12 @@ function scanKrakenFromMemory() {
     const sig = detectFigure(closes, volumes, livePrice);
     if (!sig) continue;
 
-    const volRatio = volumes[volumes.length-1] / avg(volumes.slice(-20));
+    const volRatio = volumes[volumes.length-1] / avg(volumes.slice(-50));
     const signal = {
       symbol,
       exchange:    'Kraken',
       exchangeId:  'kraken',
-      timeframe:   '30m',
+      timeframe:   '1d',
       market:      'Spot',
       figure:      sig.fig.name,
       figureCode:  sig.fig.code,
@@ -408,7 +408,7 @@ function scanKrakenFromMemory() {
       symbol, exchange:'Kraken', market:'Spot',
       figure:sig.fig.name, direction:sig.fig.dir,
       confidence:signal.confidence, entryPrice:price,
-      tp:sig.tp, sl:sig.sl, volumeRatio:volRatio, timeframe:'30m'
+      tp:sig.tp, sl:sig.sl, volumeRatio:volRatio, timeframe:'1d'
     }).save().catch(()=>{});
   }
   return results;
@@ -443,7 +443,7 @@ async function scanExchangeRest(exConfig) {
       const batch = symbols.slice(i, i + BATCH);
       const batchResults = await Promise.all(batch.map(async (symbol) => {
         try {
-          const ohlcv = await exchange.fetchOHLCV(symbol, '30m', undefined, 50);
+          const ohlcv = await exchange.fetchOHLCV(symbol, '1d', undefined, 160);
           if (!ohlcv || ohlcv.length < 20) return null;
           const closes  = ohlcv.map(c => c[4]);
           const volumes = ohlcv.map(c => c[5]);
@@ -451,9 +451,9 @@ async function scanExchangeRest(exConfig) {
           const market  = markets[symbol].type;
           const sig = detectFigure(closes, volumes, price);
           if (!sig) return null;
-          const volRatio = volumes[volumes.length-1] / avg(volumes.slice(-20));
+          const volRatio = volumes[volumes.length-1] / avg(volumes.slice(-50));
           return {
-            symbol, exchange: exConfig.name, exchangeId: exConfig.id, timeframe: '30m',
+            symbol, exchange: exConfig.name, exchangeId: exConfig.id, timeframe: '1d',
             market: market === 'spot' ? 'Spot' : 'Futures',
             figure: sig.fig.name, figureCode: sig.fig.code, direction: sig.fig.dir,
             confidence: Math.round(sig.fig.wr * 100), entryPrice: price,
@@ -583,7 +583,7 @@ async function scanAll() {
   }
   scanRunning = true;
   const startTime = Date.now();
-  console.log(`\n=== SCAN 30m â€” ${new Date().toLocaleTimeString()} ===`);
+  console.log(`\n=== SCAN 1D â€” ${new Date().toLocaleTimeString()} ===`);
   signalsCache.length = 0;
   Object.keys(signalsByExchange).forEach(k => delete signalsByExchange[k]);
 
@@ -749,7 +749,7 @@ app.post('/connect', async (req, res) => {
       { apiKey, apiSecret:secret, exchangeName, active:true, tradeAmount:tradeAmount||TRADE_AMOUNT },
       { upsert:true, new:true }
     );
-    res.json({ success:true, message:`Connecte sur ${exchangeName} Â· $${tradeAmount||TRADE_AMOUNT}/trade Â· TP/SL Dynamiques Â· 30m` });
+    res.json({ success:true, message:`Connecte sur ${exchangeName} Â· $${tradeAmount||TRADE_AMOUNT}/trade Â· TP+5.2% SL-1% Â· Daily 150 bougies` });
   } catch(e) { res.json({ success:false, error:e.message }); }
 });
 app.get(`/status/:email`, async (req, res) => {
@@ -879,11 +879,11 @@ app.post('/toggle', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n Bender Pro v8.0 Â· Port ${PORT}`);
-  console.log(` Figures chartistes + Volume Â· TP/SL Dynamiques Â· 30m`);
+  console.log(` Figures chartistes + Volume Â· TP+5.2% SL-1% Â· Daily 150 bougies`);
   console.log(` Scan Kraken via WebSocket (quasi instantane)`);
   console.log(` Helmet actif Â· Securite HTTP headers`);
   console.log(` $${TRADE_AMOUNT}/trade Â· SL -1% Â· TP +4% Â· Ratio 4:1`);
-  console.log(` Scan toutes les 60 secondes (bougies 30m)\n`);
+  console.log(` Scan toutes les 60 secondes (bougies 1D)\n`);
   setImmediate(() => {
     initKrakenWS().then(() => {
       setTimeout(() => scanAll().catch(console.error), 5000);
