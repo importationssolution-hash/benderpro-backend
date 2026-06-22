@@ -15,7 +15,7 @@ app.use(express.json());
 // CONFIG
 const TRADE_AMOUNT   = 5; // Minimum 5 USD par trade
 const SL_PCT         = 0.01;   // -1%
-const TP_PCT         = 0.04;   // +4%
+const TP_PCT         = 0.052;  // +5.2% (SL 1% + frais 1.6% x2 = ratio 2:1)
 const MAX_CONCURRENT = 20;
 const VOL_CONFIRM    = 1.8;
 const SCAN_INTERVAL  = 60 * 1000; // scan toutes les 60s (bougies 5m)
@@ -89,30 +89,30 @@ const OpenPosition  = mongoose.model('OpenPosition',  OpenPositionSchema);
 // FIGURES CHARTISTES
 const FIGURES = [
   { name:'Cup & Handle',     code:'C&H',   dir:'Long',  wr:0.84 },
-  { name:'ETE',              code:'ETE',   dir:'Short', wr:0.83 },
+  // ETE retire â€” Short uniquement
   { name:'ETE Inverse',      code:'ETEi',  dir:'Long',  wr:0.81 },
-  { name:'Double Top',       code:'2Top',  dir:'Short', wr:0.78 },
+  // Double Top retire â€” Short uniquement
   { name:'Double Bottom',    code:'2Bot',  dir:'Long',  wr:0.76 },
   { name:'Triangle Asc.',    code:'TriA',  dir:'Long',  wr:0.74 },
-  { name:'Triangle Desc.',   code:'TriD',  dir:'Short', wr:0.73 },
+  // Triangle Desc. retire â€” Short uniquement
   { name:'Drapeau Haussier', code:'DrapH', dir:'Long',  wr:0.76 },
-  { name:'Drapeau Baissier', code:'DrapB', dir:'Short', wr:0.75 },
-  { name:'Biseau Haussier',  code:'BisH',  dir:'Short', wr:0.72 },
+  // Drapeau Baissier retire â€” Short uniquement
+  // Biseau Haussier retire â€” Short uniquement
   { name:'Biseau Baissier',  code:'BisB',  dir:'Long',  wr:0.73 },
 ];
 
 // EXCHANGES (affichage seulement â€” le scan WebSocket rapide ne couvre que Kraken pour l'instant)
 const EXCHANGES_CONFIG = [
-  { id:'kraken',      name:'Kraken',   spot:true,  futures:true  },
-  { id:'binance',     name:'Binance',  spot:true,  futures:true  },
-  { id:'bybit',       name:'Bybit',    spot:true,  futures:true  },
-  { id:'bitget',      name:'Bitget',   spot:true,  futures:true  },
-  { id:'okx',         name:'OKX',      spot:true,  futures:true  },
-  { id:'kucoin',      name:'KuCoin',   spot:true,  futures:true  },
-  { id:'gateio',      name:'Gate.io',  spot:true,  futures:true  },
-  { id:'mexc',        name:'MEXC',     spot:true,  futures:true  },
-  { id:'bingx',       name:'BingX',    spot:true,  futures:true  },
-  { id:'phemex',      name:'Phemex',   spot:true,  futures:true  },
+  { id:'kraken',      name:'Kraken',   spot:true,  futures:false },
+  { id:'binance',     name:'Binance',  spot:true,  futures:false },
+  { id:'bybit',       name:'Bybit',    spot:true,  futures:false },
+  { id:'bitget',      name:'Bitget',   spot:true,  futures:false },
+  { id:'okx',         name:'OKX',      spot:true,  futures:false },
+  { id:'kucoin',      name:'KuCoin',   spot:true,  futures:false },
+  { id:'gateio',      name:'Gate.io',  spot:true,  futures:false },
+  { id:'mexc',        name:'MEXC',     spot:true,  futures:false },
+  { id:'bingx',       name:'BingX',    spot:true,  futures:false },
+  { id:'phemex',      name:'Phemex',   spot:true,  futures:false },
   { id:'coinbasepro', name:'Coinbase', spot:true,  futures:false },
   { id:'bitfinex',    name:'Bitfinex', spot:true,  futures:false },
   { id:'bitstamp',    name:'Bitstamp', spot:true,  futures:false },
@@ -125,10 +125,8 @@ const marketsCache = {};
 
 function avg(arr) { return arr.reduce((a,b)=>a+b,0)/arr.length; }
 
-// detectFigure â€” TP/SL DYNAMIQUES bases sur la geometrie de la figure
-// TP = projection de la hauteur de la figure depuis le point de cassure
-// SL = sous/sur le niveau technique naturel de la figure
-// Timeframe: 1D (bougies journalieres)
+// detectFigure â€” TP/SL FIXES Â· Entree a la cassure de resistance
+// TP = +5.2% fixe / SL = -1% fixe / Filtre = 20% hauteur minimum
 function detectFigure(closes, volumes, livePrice) {
   if (closes.length < 20) return null;
   const n = closes.length;
@@ -143,90 +141,49 @@ function detectFigure(closes, volumes, livePrice) {
   const figH = h - l;
   const range = figH / price;
   const trend10 = (price - closes[n-11]) / closes[n-11];
-  // Filtre: figure trop petite â€” TP insuffisant pour couvrir les frais (0.80%x2=1.6%)
-  // On exige minimum 3% de hauteur pour garantir un gain net positif
-  if (range < 0.03) return null;
 
+  // Filtre: figure minimum 20% de hauteur
+  if (range < 0.20) return null;
 
-  // Cup & Handle: TP = cassure + hauteur coupe / SL = sous bas du handle
+  const tp = +(price * (1 + TP_PCT)).toFixed(8);
+  const sl = +(price * (1 - SL_PCT)).toFixed(8);
+
+  // Cup & Handle â€” entree des que resistance franchie
   if (n >= 15) {
     const midLow = Math.min(...closes.slice(n-12, n-4));
     const resistance = Math.max(...closes.slice(n-6, n-1));
-    const handleLow = Math.min(...closes.slice(n-5, n-1));
     if (midLow < closes[n-14]*0.95 && price > resistance && volRatio > 1.8)
-      return { fig:FIGURES[0], tp:+(price+figH).toFixed(8), sl:+(handleLow*0.995).toFixed(8),
-        tpPct:((figH/price)*100).toFixed(2), slPct:(((price-handleLow*0.995)/price)*100).toFixed(2) };
+      return { fig:FIGURES[0], tp, sl };
   }
-  // ETE: TP = neckline - hauteur tete / SL = au-dessus epaule droite
-  if (n >= 15) {
-    const head = Math.max(...closes.slice(n-12, n-4));
-    const sh = Math.max(...closes.slice(n-14, n-10));
-    const neckline = Math.min(...closes.slice(n-12, n-2));
-    const epaule = Math.max(...closes.slice(n-5, n-1));
-    if (head>sh*1.02 && head>closes[n-2]*1.02 && price < neckline && volRatio>1.5)
-      return { fig:FIGURES[1], tp:+(price-(head-neckline)).toFixed(8), sl:+(epaule*1.005).toFixed(8),
-        tpPct:(((head-neckline)/price)*100).toFixed(2), slPct:(((epaule*1.005-price)/price)*100).toFixed(2) };
-  }
-  // ETE Inverse: TP = neckline + hauteur tete / SL = sous epaule droite
+  // ETE retire (Short â€” Spot Long seulement)
+  // ETE Inverse â€” entree des que neckline cassee a la hausse
   if (n >= 15) {
     const headL = Math.min(...closes.slice(n-12, n-4));
     const shL = Math.min(...closes.slice(n-14, n-10));
     const necklineL = Math.max(...closes.slice(n-12, n-2));
-    const epauleL = Math.min(...closes.slice(n-5, n-1));
     if (headL<shL*0.98 && headL<closes[n-2]*0.98 && price > necklineL && volRatio>1.5)
-      return { fig:FIGURES[2], tp:+(price+(necklineL-headL)).toFixed(8), sl:+(epauleL*0.995).toFixed(8),
-        tpPct:(((necklineL-headL)/price)*100).toFixed(2), slPct:(((price-epauleL*0.995)/price)*100).toFixed(2) };
+      return { fig:FIGURES[2], tp, sl };
   }
-  // Double Top: TP = creux - distance sommet-creux / SL = au-dessus des tops
-  if (n >= 10) {
-    const mx1=Math.max(...closes.slice(n-10,n-5)), mx2=Math.max(...closes.slice(n-5,n));
-    const creux = Math.min(...closes.slice(n-8, n-2));
-    const topLevel = Math.max(mx1, mx2);
-    if (Math.abs(mx1-mx2)/mx1<0.015 && price < creux && volRatio>1.4)
-      return { fig:FIGURES[3], tp:+(price-(topLevel-creux)).toFixed(8), sl:+(topLevel*1.005).toFixed(8),
-        tpPct:(((topLevel-creux)/price)*100).toFixed(2), slPct:(((topLevel*1.005-price)/price)*100).toFixed(2) };
-  }
-  // Double Bottom: TP = sommet + distance sommet-creux / SL = sous les creux
+  // Double Top retire (Short â€” Spot Long seulement)
+  // Double Bottom â€” entree des que resistance cassee
   if (n >= 10) {
     const mn1=Math.min(...closes.slice(n-10,n-5)), mn2=Math.min(...closes.slice(n-5,n));
     const sommet = Math.max(...closes.slice(n-8, n-2));
-    const botLevel = Math.min(mn1, mn2);
     if (Math.abs(mn1-mn2)/mn1<0.015 && price > sommet && volRatio>1.4)
-      return { fig:FIGURES[4], tp:+(price+(sommet-botLevel)).toFixed(8), sl:+(botLevel*0.995).toFixed(8),
-        tpPct:(((sommet-botLevel)/price)*100).toFixed(2), slPct:(((price-botLevel*0.995)/price)*100).toFixed(2) };
+      return { fig:FIGURES[4], tp, sl };
   }
-  // Triangle Ascendant: TP = resistance + hauteur / SL = sous dernier creux
-  if (range<0.04 && trend10>0.01 && price > h*0.999 && volRatio>1.6) {
-    const lastLow = Math.min(...closes.slice(n-5, n-1));
-    return { fig:FIGURES[5], tp:+(price+figH*0.8).toFixed(8), sl:+(lastLow*0.995).toFixed(8),
-      tpPct:((figH*0.8/price)*100).toFixed(2), slPct:(((price-lastLow*0.995)/price)*100).toFixed(2) };
-  }
-  // Triangle Descendant: TP = support - hauteur / SL = au-dessus dernier sommet
-  if (range<0.04 && trend10<-0.01 && price < l*1.001 && volRatio>1.6) {
-    const lastHigh = Math.max(...closes.slice(n-5, n-1));
-    return { fig:FIGURES[6], tp:+(price-figH*0.8).toFixed(8), sl:+(lastHigh*1.005).toFixed(8),
-      tpPct:((figH*0.8/price)*100).toFixed(2), slPct:(((lastHigh*1.005-price)/price)*100).toFixed(2) };
-  }
-  // Drapeau Haussier: TP = mat projete / SL = sous bas du canal
-  if (trend10>0.06 && range<0.025 && price > h*0.999 && volRatio>1.8) {
-    const flagLow = Math.min(...closes.slice(n-6, n-1));
-    return { fig:FIGURES[7], tp:+(price+figH).toFixed(8), sl:+(flagLow*0.995).toFixed(8),
-      tpPct:((figH/price)*100).toFixed(2), slPct:(((price-flagLow*0.995)/price)*100).toFixed(2) };
-  }
-  // Drapeau Baissier: TP = mat projete vers bas / SL = au-dessus haut du canal
-  if (trend10<-0.06 && range<0.025 && price < l*1.001 && volRatio>1.8) {
-    const flagHigh = Math.max(...closes.slice(n-6, n-1));
-    return { fig:FIGURES[8], tp:+(price-figH).toFixed(8), sl:+(flagHigh*1.005).toFixed(8),
-      tpPct:((figH/price)*100).toFixed(2), slPct:(((flagHigh*1.005-price)/price)*100).toFixed(2) };
-  }
-  // Biseau Haussier (bearish): SL = au-dessus du haut du biseau
-  if (range<0.035 && trend10>0.02 && trend10<0.05 && price < l*1.001 && volRatio>1.7)
-    return { fig:FIGURES[9], tp:+(price-figH*0.75).toFixed(8), sl:+(h*1.005).toFixed(8),
-      tpPct:((figH*0.75/price)*100).toFixed(2), slPct:(((h*1.005-price)/price)*100).toFixed(2) };
-  // Biseau Baissier (bullish): SL = sous le bas du biseau
+  // Triangle Ascendant â€” cassure resistance haute
+  if (range<0.04 && trend10>0.01 && price > h*0.999 && volRatio>1.6)
+    return { fig:FIGURES[5], tp, sl };
+  // Triangle Descendant retire (Short â€” Spot Long seulement)
+  // Drapeau Haussier â€” cassure haut du canal
+  if (trend10>0.06 && range<0.025 && price > h*0.999 && volRatio>1.8)
+    return { fig:FIGURES[7], tp, sl };
+  // Drapeau Baissier retire (Short â€” Spot Long seulement)
+  // Biseau Haussier retire (Short â€” Spot Long seulement)
+  // Biseau Baissier (bullish) â€” cassure haut du biseau
   if (range<0.035 && trend10<-0.02 && trend10>-0.05 && price > h*0.999 && volRatio>1.7)
-    return { fig:FIGURES[10], tp:+(price+figH*0.75).toFixed(8), sl:+(l*0.995).toFixed(8),
-      tpPct:((figH*0.75/price)*100).toFixed(2), slPct:(((price-l*0.995)/price)*100).toFixed(2) };
+    return { fig:FIGURES[10], tp, sl };
 
   return null;
 }
@@ -292,7 +249,7 @@ function connectKrakenWS(pairs) {
         params: {
           channel: 'ohlc',
           symbol: chunk,
-          interval: 1440
+          interval: 30
         }
       }));
     }
@@ -345,7 +302,7 @@ async function preloadHistoricalCandles(pairs) {
     const batch = pairs.slice(i, i + BATCH);
     await Promise.all(batch.map(async (symbol) => {
       try {
-        const ohlcv = await exchange.fetchOHLCV(symbol, '1d', undefined, 55);
+        const ohlcv = await exchange.fetchOHLCV(symbol, '30m', undefined, 55);
         if (!ohlcv || ohlcv.length < 10) return;
         krakenCandles[symbol] = ohlcv.map(c => ({
           t: String(c[0]),
@@ -396,7 +353,7 @@ function scanKrakenFromMemory() {
       symbol,
       exchange:    'Kraken',
       exchangeId:  'kraken',
-      timeframe:   '1d',
+      timeframe:   '30m',
       market:      'Spot',
       figure:      sig.fig.name,
       figureCode:  sig.fig.code,
@@ -417,7 +374,7 @@ function scanKrakenFromMemory() {
       symbol, exchange:'Kraken', market:'Spot',
       figure:sig.fig.name, direction:sig.fig.dir,
       confidence:signal.confidence, entryPrice:price,
-      tp:sig.tp, sl:sig.sl, volumeRatio:volRatio, timeframe:'1d'
+      tp:sig.tp, sl:sig.sl, volumeRatio:volRatio, timeframe:'30m'
     }).save().catch(()=>{});
   }
   return results;
@@ -443,8 +400,7 @@ async function scanExchangeRest(exConfig) {
         const m = markets[s];
         const isUSDT = s.endsWith('/USDT') || s.endsWith(':USDT');
         const isSpot = m.type === 'spot' && exConfig.spot;
-        const isFut  = (m.type === 'future' || m.type === 'swap') && exConfig.futures;
-        return isUSDT && (isSpot || isFut) && m.active;
+        return isUSDT && isSpot && m.active;
       })
       .slice(0, 100); // limite plus basse en REST pour rester sous 60s
 
@@ -453,7 +409,7 @@ async function scanExchangeRest(exConfig) {
       const batch = symbols.slice(i, i + BATCH);
       const batchResults = await Promise.all(batch.map(async (symbol) => {
         try {
-          const ohlcv = await exchange.fetchOHLCV(symbol, '1d', undefined, 50);
+          const ohlcv = await exchange.fetchOHLCV(symbol, '30m', undefined, 50);
           if (!ohlcv || ohlcv.length < 20) return null;
           const closes  = ohlcv.map(c => c[4]);
           const volumes = ohlcv.map(c => c[5]);
@@ -463,7 +419,7 @@ async function scanExchangeRest(exConfig) {
           if (!sig) return null;
           const volRatio = volumes[volumes.length-1] / avg(volumes.slice(-20));
           return {
-            symbol, exchange: exConfig.name, exchangeId: exConfig.id, timeframe: '5m',
+            symbol, exchange: exConfig.name, exchangeId: exConfig.id, timeframe: '30m',
             market: market === 'spot' ? 'Spot' : 'Futures',
             figure: sig.fig.name, figureCode: sig.fig.code, direction: sig.fig.dir,
             confidence: Math.round(sig.fig.wr * 100), entryPrice: price,
@@ -593,7 +549,7 @@ async function scanAll() {
   }
   scanRunning = true;
   const startTime = Date.now();
-  console.log(`\n=== SCAN 1D â€” ${new Date().toLocaleTimeString()} ===`);
+  console.log(`\n=== SCAN 30m â€” ${new Date().toLocaleTimeString()} ===`);
   signalsCache.length = 0;
   Object.keys(signalsByExchange).forEach(k => delete signalsByExchange[k]);
 
@@ -759,53 +715,10 @@ app.post('/connect', async (req, res) => {
       { apiKey, apiSecret:secret, exchangeName, active:true, tradeAmount:tradeAmount||TRADE_AMOUNT },
       { upsert:true, new:true }
     );
-    res.json({ success:true, message:`Connecte sur ${exchangeName} Â· $${tradeAmount||TRADE_AMOUNT}/trade Â· TP/SL Dynamiques Â· 1D` });
+    res.json({ success:true, message:`Connecte sur ${exchangeName} Â· $${tradeAmount||TRADE_AMOUNT}/trade Â· TP/SL Dynamiques Â· 30m` });
   } catch(e) { res.json({ success:false, error:e.message }); }
 });
-
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// ROUTES FUTURES â€” systeme separe de Kraken Spot, cle API differente
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-const { FuturesUser, FuturesTrade, MAX_TRADE_AMOUNT_USD: FUTURES_MAX_AMOUNT, MAX_LEVERAGE: FUTURES_MAX_LEVERAGE } = require('./bot-futures');
-
-app.post('/connect-futures', async (req, res) => {
-  const { email, apiKey, secret, tradeAmount, leverage } = req.body;
-  if (!email || !apiKey || !secret)
-    return res.json({ success:false, error:'Donnees manquantes (cle API Futures requise, differente de la cle Spot)' });
-  try {
-    await FuturesUser.findOneAndUpdate(
-      { email },
-      { apiKey, apiSecret:secret, active:true, tradeAmount: tradeAmount || 2, leverage: leverage || 1 },
-      { upsert:true, new:true }
-    );
-    res.json({
-      success:true,
-      message:`Connecte sur Kraken Futures Â· $${tradeAmount||2}/trade Â· Levier ${leverage||1}x (max ${FUTURES_MAX_LEVERAGE}x)`
-    });
-  } catch(e) { res.json({ success:false, error:e.message }); }
-});
-
-app.get('/futures-trades/:email', async (req, res) => {
-  const trades = await FuturesTrade.find({ email: req.params.email }).sort({ time: -1 }).limit(100);
-  res.json({ success: true, trades, count: trades.length });
-});
-
-app.get('/futures-status/:email', async (req, res) => {
-  const user = await FuturesUser.findOne({ email: req.params.email });
-  if (!user) return res.json({ connected: false });
-  const trades = await FuturesTrade.countDocuments({ email: req.params.email });
-  res.json({
-    connected: true,
-    active: user.active,
-    tradeAmount: user.tradeAmount,
-    leverage: user.leverage,
-    maxAllowedAmount: FUTURES_MAX_AMOUNT,
-    maxAllowedLeverage: FUTURES_MAX_LEVERAGE,
-    trades
-  });
-});
-
-app.get('/status/:email', async (req, res) => {
+app.get(`/status/:email`, async (req, res) => {
   const user = await User.findOne({ email:req.params.email });
   if (!user) return res.json({ connected:false });
   const trades = await Trade.countDocuments({ email:req.params.email });
@@ -932,11 +845,11 @@ app.post('/toggle', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n Bender Pro v8.0 Â· Port ${PORT}`);
-  console.log(` Figures chartistes + Volume Â· TP/SL Dynamiques Â· 1D`);
+  console.log(` Figures chartistes + Volume Â· TP/SL Dynamiques Â· 30m`);
   console.log(` Scan Kraken via WebSocket (quasi instantane)`);
   console.log(` Helmet actif Â· Securite HTTP headers`);
   console.log(` $${TRADE_AMOUNT}/trade Â· SL -1% Â· TP +4% Â· Ratio 4:1`);
-  console.log(` Scan toutes les 60 secondes (bougies 1D)\n`);
+  console.log(` Scan toutes les 60 secondes (bougies 30m)\n`);
   setImmediate(() => {
     initKrakenWS().then(() => {
       setTimeout(() => scanAll().catch(console.error), 5000);
