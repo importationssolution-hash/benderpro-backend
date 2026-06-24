@@ -852,7 +852,7 @@ app.get(`/billing/:email`, async (req, res) => {
         wallet:      BILLING_WALLET,
         message:     totalPnl <= 0
           ? 'Commission due: $${commission} USD (0.25% des $${totalVolume.toFixed(4)} trades)'
-          : `Commission due: $${commission} USD (0.5% du volume total de $${totalVolume.toFixed(4)})`,
+          : `Commission due: $${commission} USD (0.5% du volume total de $${totalVolume.toFixed(4)})`},
       }
     });
   } catch(e) { res.json({ success:false, error:e.message });
