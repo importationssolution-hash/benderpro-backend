@@ -20,6 +20,7 @@ const MAX_CONCURRENT = 20;
 const VOL_CONFIRM    = 1.8;
 const SCAN_INTERVAL  = 60 * 1000; // scan toutes les 60s (bougies 1D)
 const MAX_PAIRS      = 500;
+const MAX_SIGNALS_CACHE = 200;
 
 // MONGODB
 mongoose.connect(process.env.MONGODB_URI)
@@ -289,18 +290,18 @@ function connectKrakenWS(pairs) {
         for (const c of msg.data) {
           const sym = c.symbol;
           if (!krakenCandles[sym]) krakenCandles[sym] = [];
-          const candle = { o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume, t: c.interval_begin };
-          const arr = krakenCandles[sym];
-          if (arr.length > 0 && arr[arr.length - 1].t === candle.t) {
-            arr[arr.length - 1] = candle;
+          // Stocker seulement close + volume â†’ 3x moins de RAM
+          const arr = krakenCandles[sym] || (krakenCandles[sym] = []);
+          const lastC = arr[arr.length - 1];
+          if (lastC && Math.abs(lastC.c - c.close) / (c.close||1) < 0.5) {
+            lastC.c = c.close; lastC.v = c.volume;
           } else {
-            arr.push(candle);
+            arr.push({ c: c.close, v: c.volume });
             if (arr.length > 150) arr.shift();
           }
-          setImmediate(() => {
-            const results = scanKrakenFromMemory();
-            results.forEach(r => signalsCache.push(r));
-          });
+          // Scanner UNIQUEMENT cette paire immÃ©diatement â€” pas les 500
+          // â†’ dÃ©tection instantanÃ©e sans OOM
+          setImmediate(() => scanSinglePair(sym));
         }
       }
     } catch (e) {}
@@ -327,7 +328,7 @@ async function preloadHistoricalCandles(pairs) {
         const ohlcv = await exchange.fetchOHLCV(symbol, '1d', undefined, 160);
         if (!ohlcv || ohlcv.length < 10) return;
         krakenCandles[symbol] = ohlcv.map(c => ({
-          t: String(c[0]), o: c[1], h: c[2], l: c[3], c: c[4], v: c[6] || c[5]
+          c: c[4], v: c[6] || c[5]  // seulement close + volume en mÃ©moire
         }));
         loaded++;
       } catch (e) {}
@@ -349,6 +350,100 @@ async function initKrakenWS() {
   await preloadHistoricalCandles(krakenPairsList);
   connectKrakenWS(krakenPairsList);
   connectKrakenTicker(krakenPairsList);
+}
+
+// Anti-spam: Ã©viter de remettre le mÃªme signal en cache si dÃ©jÃ  prÃ©sent
+const recentSignals = new Map(); // symbol â†’ timestamp dernier signal
+
+// Scan d'UNE seule paire â€” appelÃ© instantanÃ©ment sur chaque update WebSocket
+function scanSinglePair(symbol) {
+  try {
+    const candles = krakenCandles[symbol];
+    if (!candles || candles.length < 100) return;
+    const closes  = candles.map(c => c.c);
+    const volumes = candles.map(c => c.v);
+    const livePrice = livePrices[symbol] || closes[closes.length - 1];
+    const sig = detectFigure(closes, volumes, livePrice);
+    if (!sig) return;
+
+    // Anti-spam: mÃªme signal ignorÃ© pendant 5 minutes
+    const lastSig = recentSignals.get(symbol);
+    if (lastSig && Date.now() - lastSig < 5 * 60 * 1000) return;
+    recentSignals.set(symbol, Date.now());
+
+    const volRatio = volumes[volumes.length - 1] / avg(volumes.slice(-50));
+    const signal = {
+      symbol,
+      exchange:    'Kraken',
+      exchangeId:  'kraken',
+      timeframe:   '1d',
+      market:      'Spot',
+      figure:      sig.fig.name,
+      figureCode:  sig.fig.code,
+      direction:   sig.fig.dir,
+      confidence:  Math.round(sig.fig.wr * 100),
+      reliable:    sig.fig.wr >= 0.65,
+      entryPrice:  livePrice,
+      tp:          sig.tp,
+      sl:          sig.sl,
+      volumeRatio: volRatio.toFixed(2),
+      tradeAmount: TRADE_AMOUNT,
+      gain:        (TRADE_AMOUNT * TP_PCT).toFixed(4),
+      loss:        (TRADE_AMOUNT * SL_PCT).toFixed(4),
+      time:        new Date()
+    };
+
+    // Ajouter au cache (remplacer si dÃ©jÃ  prÃ©sent)
+    const idx = signalsCache.findIndex(s => s.symbol === symbol);
+    if (idx >= 0) signalsCache[idx] = signal;
+    else if (signalsCache.length < MAX_SIGNALS_CACHE) signalsCache.push(signal);
+
+    // Sauvegarder en DB
+    new Signal({
+      symbol, exchange: 'Kraken', market: 'Spot',
+      figure: sig.fig.name, direction: sig.fig.dir,
+      confidence: signal.confidence, entryPrice: livePrice,
+      tp: sig.tp, sl: sig.sl, volumeRatio: volRatio, timeframe: '1d'
+    }).save().catch(() => {});
+
+    // ExÃ©cuter le trade immÃ©diatement si utilisateurs connectÃ©s
+    executeTrade(signal).catch(() => {});
+
+    console.log(`[Signal] ${symbol} Â· ${sig.fig.name} Â· ${livePrice}`);
+  } catch(e) {}
+}
+
+// ExÃ©cute un trade pour tous les utilisateurs Kraken connectÃ©s
+async function executeTrade(signal) {
+  try {
+    const users = await User.find({ active: true, apiKey: { $exists: true }, exchangeName: /kraken/i });
+    for (const user of users) {
+      try {
+        const existingPos = await OpenPosition.findOne({ email: user.email, symbol: signal.symbol });
+        if (existingPos) continue;
+        const ExClass = ccxt['kraken'];
+        if (!ExClass) continue;
+        const exchange = new ExClass({ apiKey: user.apiKey, secret: user.apiSecret, enableRateLimit: true });
+        const balance = await exchange.fetchBalance();
+        const usd = balance.USD?.free || 0;
+        const amount = Math.min(Math.max(user.tradeAmount || TRADE_AMOUNT, 5), 50);
+        if (usd < amount) { console.log(`[Bot] Solde insuffisant pour ${user.email}`); continue; }
+        const qty     = amount / signal.entryPrice;
+        const tpPrice = signal.tp;
+        const slPrice = signal.sl;
+        console.log(`[Bot] ORDRE BUY: ${signal.symbol} Â· ${signal.figure} Â· $${amount} Â· TP:${tpPrice} Â· SL:${slPrice}`);
+        const order = await exchange.createOrder(signal.symbol, 'market', 'buy', qty, undefined, { oflags: 'fciq' });
+        console.log(`[Bot] Ordre exÃ©cutÃ©: ${order.id}`);
+        await new OpenPosition({ email: user.email, symbol: signal.symbol, exchange: 'Kraken',
+          figure: signal.figure, entryPrice: signal.entryPrice,
+          tp: tpPrice, sl: slPrice, qty, amount }).save();
+        await new Trade({ email: user.email, symbol: signal.symbol, exchange: 'Kraken',
+          market: 'Spot', direction: signal.direction, figure: signal.figure,
+          entryPrice: signal.entryPrice, exitPrice: null, amount, pnl: 0,
+          result: 'OPEN', exitReason: 'Position ouverte â€” en attente TP/SL' }).save();
+      } catch(e) { console.log(`[Bot] Erreur trade ${signal.symbol}:`, e.message); }
+    }
+  } catch(e) { console.log('[executeTrade] Erreur:', e.message); }
 }
 
 function scanKrakenFromMemory() {
@@ -455,41 +550,98 @@ async function scanExchangeRest(exConfig) {
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // SUIVI TP/SL INSTANTANÃ‰ â€” toutes les 2 secondes via prix WebSocket
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Verrou anti-boucle: positions en cours de traitement
+const positionsInProgress = new Set();
+
 async function checkTPSLInstant() {
   try {
     const positions = await OpenPosition.find({});
     if (positions.length === 0) return;
+
     for (const pos of positions) {
+      const posId = pos._id.toString();
+
+      // Skip si deja en cours de traitement (evite les doublons toutes les 2s)
+      if (positionsInProgress.has(posId)) continue;
+
       const currentPrice = livePrices[pos.symbol];
       if (!currentPrice) continue;
+
+      // Validation TP/SL coherents (TP doit etre > entryPrice, SL < entryPrice)
+      if (pos.tp <= pos.entryPrice || pos.sl >= pos.entryPrice) {
+        console.log(`[INSTANT TP/SL] âš  TP/SL incohÃ©rents pour ${pos.symbol} â€” correction auto`);
+        const correctedTP = +(pos.entryPrice * (1 + TP_PCT)).toFixed(8);
+        const correctedSL = +(pos.entryPrice * (1 - SL_PCT)).toFixed(8);
+        await OpenPosition.updateOne({ _id: pos._id }, { tp: correctedTP, sl: correctedSL });
+        console.log(`[INSTANT TP/SL] CorrigÃ©: TP=${correctedTP} SL=${correctedSL}`);
+        continue;
+      }
+
       const hitTP = currentPrice >= pos.tp;
       const hitSL = currentPrice <= pos.sl;
       if (!hitTP && !hitSL) continue;
+
       const reason = hitTP ? 'TP' : 'SL';
       console.log(`[INSTANT ${reason}] ${pos.symbol} prix:${currentPrice} TP:${pos.tp} SL:${pos.sl}`);
+
+      positionsInProgress.add(posId);
       try {
         const user = await User.findOne({ email: pos.email });
-        if (!user) { await OpenPosition.deleteOne({ _id: pos._id }); continue; }
-        const ExClass = ccxt[user.exchangeName.toLowerCase()];
-        if (!ExClass) continue;
+        if (!user) {
+          await OpenPosition.deleteOne({ _id: pos._id });
+          positionsInProgress.delete(posId);
+          continue;
+        }
+
+        const exchangeName = user.exchangeName.toLowerCase();
+        const ExClass = ccxt[exchangeName];
+        if (!ExClass) {
+          console.log(`[INSTANT TP/SL] Exchange ${exchangeName} non supportÃ© â€” position supprimÃ©e`);
+          await OpenPosition.deleteOne({ _id: pos._id });
+          positionsInProgress.delete(posId);
+          continue;
+        }
+
         const exchange = new ExClass({ apiKey: user.apiKey, secret: user.apiSecret, enableRateLimit: true });
         const balance = await exchange.fetchBalance();
         const [base] = pos.symbol.split('/');
-        const baseBalance = balance[base]?.free || pos.qty;
+        const baseBalance = balance[base]?.free || 0;
 
-        if (baseBalance > 0.000001) {
-          const order = await exchange.createOrder(pos.symbol, 'market', 'sell', baseBalance, undefined, { oflags: 'fciq' });
-          console.log(`[INSTANT ${reason}] Ordre SELL execute: ${order.id}`);
-          const pnl = hitTP ? pos.amount * TP_PCT : -(pos.amount * SL_PCT);
+        if (baseBalance < 0.000001) {
+          // Fonds insuffisants â€” la position a probablement deja ete vendue manuellement
+          console.log(`[INSTANT ${reason}] ${pos.symbol} â€” solde ${base} insuffisant (${baseBalance}) â€” position supprimÃ©e de la DB`);
           await Trade.findOneAndUpdate(
             { email: pos.email, symbol: pos.symbol, result: 'OPEN' },
-            { exitPrice: currentPrice, pnl, result: hitTP ? 'WIN' : 'LOSS', exitReason: hitTP ? `TP +${TP_PCT*100}% atteint` : `SL -${SL_PCT*100}% touche` },
+            { exitPrice: currentPrice, pnl: 0, result: 'CLOSED_MANUAL', exitReason: 'Vendu manuellement ou solde vide' },
             { sort: { time: -1 } }
           );
           await OpenPosition.deleteOne({ _id: pos._id });
-          console.log(`[INSTANT ${reason}] Position fermee PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)}`);
+          positionsInProgress.delete(posId);
+          continue;
         }
-      } catch (e) { console.log(`[INSTANT TP/SL] Erreur ${pos.symbol}:`, e.message); }
+
+        const order = await exchange.createOrder(pos.symbol, 'market', 'sell', baseBalance, undefined, { oflags: 'fciq' });
+        console.log(`[INSTANT ${reason}] Ordre SELL execute: ${order.id}`);
+        const pnl = hitTP ? pos.amount * TP_PCT : -(pos.amount * SL_PCT);
+        await Trade.findOneAndUpdate(
+          { email: pos.email, symbol: pos.symbol, result: 'OPEN' },
+          { exitPrice: currentPrice, pnl, result: hitTP ? 'WIN' : 'LOSS', exitReason: hitTP ? `TP +${TP_PCT*100}% atteint` : `SL -${SL_PCT*100}% touche` },
+          { sort: { time: -1 } }
+        );
+        await OpenPosition.deleteOne({ _id: pos._id });
+        console.log(`[INSTANT ${reason}] Position fermee PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)}`);
+
+      } catch (e) {
+        console.log(`[INSTANT TP/SL] Erreur ${pos.symbol}:`, e.message);
+        // Sur erreur nonce ou reseau: on retire du verrou pour reessayer au prochain cycle
+        // Sur erreur "Insufficient funds": on supprime la position
+        if (e.message && e.message.includes('Insufficient funds')) {
+          console.log(`[INSTANT TP/SL] Fonds insuffisants confirmÃ©s â€” suppression position ${pos.symbol}`);
+          await OpenPosition.deleteOne({ _id: pos._id }).catch(() => {});
+        }
+      } finally {
+        positionsInProgress.delete(posId);
+      }
     }
   } catch (e) { console.log('[INSTANT TP/SL] Erreur globale:', e.message); }
 }
@@ -505,6 +657,8 @@ async function scanAll() {
   console.log(`\n=== SCAN 1D â€” ${new Date().toLocaleTimeString()} ===`);
   signalsCache.length = 0;
   Object.keys(signalsByExchange).forEach(k => delete signalsByExchange[k]);
+  // Forcer GC si disponible (node --expose-gc)
+  if (typeof global.gc === 'function') global.gc();
 
   try {
     const users = await User.find({ active: true, apiKey: { $exists: true } });
@@ -542,6 +696,8 @@ async function scanAll() {
     lastScanTime = new Date();
     console.log(`=== FIN Â· ${signalsCache.length} signaux Â· ${Date.now() - startTime}ms ===\n`);
 
+    // Trades exÃ©cutÃ©s instantanÃ©ment par executeTrade() sur chaque signal WebSocket
+    // scanAll() est seulement un scan de rattrapage toutes les 60s
     for (const user of users) {
       const userExchangeName = user.exchangeName.toLowerCase();
       const userSignals = signalsCache.filter(s =>
@@ -879,6 +1035,10 @@ app.post('/toggle', async (req, res) => {
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // DÃ‰MARRAGE
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Augmenter la limite mÃ©moire Node.js si pas dÃ©jÃ  fait
+// â†’ Ajouter dans Render: Start Command = node --max-old-space-size=460 server.js
+// (460MB = safe pour instance 512MB)
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n Bender Pro v8.0 Â· Port ${PORT}`);
