@@ -69,16 +69,18 @@ const SignalSchema = new mongoose.Schema({
 });
 
 const OpenPositionSchema = new mongoose.Schema({
-  email:       String,
-  symbol:      String,
-  exchange:    String,
-  figure:      String,
-  entryPrice:  Number,
-  tp:          Number,
-  sl:          Number,
-  qty:         Number,
-  amount:      Number,
-  openedAt:    { type: Date, default: Date.now }
+  email:        String,
+  symbol:       String,
+  exchange:     String,
+  figure:       String,
+  entryPrice:   Number,
+  tp:           Number,
+  sl:           Number,
+  tpPct:        Number, // TP% dynamique selon hauteur figure
+  figureTarget: Number, // hauteur mesurÃ©e de la figure en %
+  qty:          Number,
+  amount:       Number,
+  openedAt:     { type: Date, default: Date.now }
 });
 
 const BillingSchema = new mongoose.Schema({
@@ -150,22 +152,31 @@ function detectFigure(closes, volumes, livePrice) {
   const range = figH / price;
   const trend10 = (price - closes[n - 51]) / closes[n - 51];
 
-  // Filtre: hauteur de la figure (haut - bas) doit reprÃ©senter au moins 70% du prix bas
-  // â†’ Le target projetÃ© (breakout + hauteur) donne un gain potentiel >= 70%
-  // Exemple: figure entre 100$ et 170$ â†’ hauteur 70% â†’ target +70% â†’ acceptÃ©
-  //          figure entre 100$ et 150$ â†’ hauteur 50% â†’ target +50% â†’ rejetÃ©
+  // Calcul de la hauteur de la figure (haut - bas) / bas
+  // â†’ DÃ©termine le TP dynamique selon la puissance du signal
   const figureTarget = (h - l) / l; // hauteur relative de la figure
-  if (figureTarget < 0.70) return null; // target price minimum 70%
 
-  const tp = +(price * (1 + TP_PCT)).toFixed(8); // TP +12%
-  const sl = +(price * (1 - SL_PCT)).toFixed(8); // SL -3%
+  // Filtre: figure trop petite (<40%) â†’ ignorÃ©e
+  if (figureTarget < 0.40) return null;
+
+  // TP dynamique selon la hauteur mesurÃ©e de la figure
+  // SL toujours -3%
+  let tpPct;
+  if      (figureTarget >= 0.80) tpPct = 0.20; // 80-100% â†’ TP +20%
+  else if (figureTarget >= 0.71) tpPct = 0.17; // 71-80%  â†’ TP +17%
+  else if (figureTarget >= 0.61) tpPct = 0.15; // 61-70%  â†’ TP +15%
+  else if (figureTarget >= 0.50) tpPct = 0.13; // 50-60%  â†’ TP +13%
+  else                           tpPct = 0.08; // 40-49%  â†’ TP +8%
+
+  const tp = +(price * (1 + tpPct)).toFixed(8);
+  const sl = +(price * (1 - SL_PCT)).toFixed(8); // SL toujours -3%
 
   // Cup & Handle
   if (n >= 100) {
     const midLow = Math.min(...closes.slice(n - 60, n - 20));
     const resistance = Math.max(...closes.slice(n - 30, n - 1));
     if (midLow < closes[n - 70] * 0.95 && price > resistance && volRatio > 1.8)
-      return { fig: FIGURES[0], tp, sl };
+      return { fig: FIGURES[0], tp, sl, figureTarget };
   }
 
   // ETE Inverse
@@ -174,7 +185,7 @@ function detectFigure(closes, volumes, livePrice) {
     const shL = Math.min(...closes.slice(n - 70, n - 50));
     const necklineL = Math.max(...closes.slice(n - 60, n - 2));
     if (headL < shL * 0.98 && headL < closes[n - 2] * 0.98 && price > necklineL && volRatio > 1.5)
-      return { fig: FIGURES[1], tp, sl };
+      return { fig: FIGURES[1], tp, sl, figureTarget };
   }
 
   // Double Bottom
@@ -183,20 +194,20 @@ function detectFigure(closes, volumes, livePrice) {
     const mn2 = Math.min(...closes.slice(n - 25, n));
     const sommet = Math.max(...closes.slice(n - 40, n - 2));
     if (Math.abs(mn1 - mn2) / mn1 < 0.015 && price > sommet && volRatio > 1.4)
-      return { fig: FIGURES[2], tp, sl };
+      return { fig: FIGURES[2], tp, sl, figureTarget };
   }
 
   // Triangle Ascendant
   if (range < 0.04 && trend10 > 0.01 && price > h * 0.999 && volRatio > 1.6)
-    return { fig: FIGURES[3], tp, sl };
+    return { fig: FIGURES[3], tp, sl, figureTarget };
 
   // Drapeau Haussier
   if (trend10 > 0.06 && range < 0.025 && price > h * 0.999 && volRatio > 1.8)
-    return { fig: FIGURES[4], tp, sl };
+    return { fig: FIGURES[4], tp, sl, figureTarget };
 
   // Biseau Baissier (bullish) â€” cassure haut du biseau
   if (range < 0.035 && trend10 < -0.02 && trend10 > -0.05 && price > h * 0.999 && volRatio > 1.7)
-    return { fig: FIGURES[5], tp, sl };
+    return { fig: FIGURES[5], tp, sl, figureTarget };
 
   return null;
 }
@@ -384,6 +395,7 @@ function scanSinglePair(symbol) {
     recentSignals.set(sigKey, Date.now());
 
     const volRatio = volumes[volumes.length - 1] / avg(volumes.slice(-50));
+    const tpPctSignal = sig.tp / livePrice - 1; // tpPct rÃ©el calculÃ©
     const signal = {
       symbol,
       exchange:    'Kraken',
@@ -398,9 +410,12 @@ function scanSinglePair(symbol) {
       entryPrice:  livePrice,
       tp:          sig.tp,
       sl:          sig.sl,
+      tpPct:       +(tpPctSignal * 100).toFixed(1),   // ex: 17.0
+      slPct:       +(SL_PCT * 100).toFixed(1),         // 3.0
+      figureTarget:+(sig.figureTarget * 100).toFixed(1), // hauteur figure %
       volumeRatio: volRatio.toFixed(2),
       tradeAmount: TRADE_AMOUNT,
-      gain:        (TRADE_AMOUNT * TP_PCT).toFixed(4),
+      gain:        (TRADE_AMOUNT * tpPctSignal).toFixed(4),
       loss:        (TRADE_AMOUNT * SL_PCT).toFixed(4),
       time:        new Date()
     };
@@ -468,7 +483,9 @@ async function executeTrade(signal) {
         console.log(`[Bot] Ordre exÃ©cutÃ©: ${order.id}`);
         await new OpenPosition({ email: user.email, symbol: signal.symbol, exchange: 'Kraken',
           figure: signal.figure, entryPrice: signal.entryPrice,
-          tp: tpPrice, sl: slPrice, qty, amount }).save();
+          tp: tpPrice, sl: slPrice,
+          tpPct: signal.tpPct, figureTarget: signal.figureTarget,
+          qty, amount }).save();
         await new Trade({ email: user.email, symbol: signal.symbol, exchange: 'Kraken',
           market: 'Spot', direction: signal.direction, figure: signal.figure,
           entryPrice: signal.entryPrice, exitPrice: null, amount, pnl: 0,
@@ -659,7 +676,9 @@ async function checkTPSLInstant() {
 
         const order = await exchange.createOrder(pos.symbol, 'market', 'sell', baseBalance, undefined, { oflags: 'fciq' });
         console.log(`[INSTANT ${reason}] Ordre SELL execute: ${order.id}`);
-        const pnl = hitTP ? pos.amount * TP_PCT : -(pos.amount * SL_PCT);
+        // Utiliser le tpPct rÃ©el de la position si disponible, sinon fallback TP_PCT
+        const posTpPct = pos.tpPct ? pos.tpPct / 100 : TP_PCT;
+        const pnl = hitTP ? pos.amount * posTpPct : -(pos.amount * SL_PCT);
         await Trade.findOneAndUpdate(
           { email: pos.email, symbol: pos.symbol, result: 'OPEN' },
           { exitPrice: currentPrice, pnl, result: hitTP ? 'WIN' : 'LOSS', exitReason: hitTP ? `TP +${TP_PCT*100}% atteint` : `SL -${SL_PCT*100}% touche` },
