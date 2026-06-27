@@ -14,7 +14,7 @@ app.use(express.json());
 
 // CONFIG
 const TRADE_AMOUNT   = 5;    // Minimum 5 USD par trade
-const SL_PCT         = 0.03; // -3%
+const SL_PCT         = 0.03; // -2%
 const TP_PCT         = 0.12; // +12%
 const MAX_CONCURRENT = 20;
 const VOL_CONFIRM    = 1.8;
@@ -169,7 +169,7 @@ function detectFigure(closes, volumes, livePrice) {
   else                           tpPct = 0.08; // 40-49%  â†’ TP +8%
 
   const tp = +(price * (1 + tpPct)).toFixed(8);
-  const sl = +(price * (1 - SL_PCT)).toFixed(8); // SL toujours -3%
+  const sl = +(price * (1 - SL_PCT)).toFixed(8); // SL toujours -2%
 
   // Cup & Handle
   if (n >= 100) {
