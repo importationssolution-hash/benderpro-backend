@@ -215,10 +215,12 @@ function detectFigure(closes, volumes, livePrice) {
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // WEBSOCKET KRAKEN
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-const krakenCandles = {};
+const krakenCandles = {};    // bougies Daily (1440 min)
+const krakenCandles4h = {};  // bougies 4h (240 min)
 let krakenPairsList = [];
 let wsConnected = false;
 let ws = null;
+let ws4h = null; // WebSocket sÃ©parÃ© pour 4h
 
 const QUOTE_CURRENCIES = ['USD'];
 
@@ -336,6 +338,52 @@ function connectKrakenWS(pairs) {
   ws.on('error', (err) => { console.log('Erreur WebSocket Kraken:', err.message); });
 }
 
+// WebSocket 4h â€” en parallÃ¨le du Daily
+function connectKrakenWS4h(pairs) {
+  if (ws4h) { try { ws4h.terminate(); } catch (e) {} }
+  ws4h = new WebSocket('wss://ws.kraken.com/v2');
+
+  ws4h.on('open', () => {
+    console.log(`[WS-4h] ConnectÃ© â€” abonnement ${pairs.length} paires`);
+    const CHUNK = 50;
+    for (let i = 0; i < pairs.length; i += CHUNK) {
+      const chunk = pairs.slice(i, i + CHUNK);
+      ws4h.send(JSON.stringify({
+        method: 'subscribe',
+        params: { channel: 'ohlc', symbol: chunk, interval: 240 } // 240 min = 4h
+      }));
+    }
+  });
+
+  ws4h.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw);
+      if (msg.channel === 'ohlc' && (msg.type === 'snapshot' || msg.type === 'update') && msg.data) {
+        for (const c of msg.data) {
+          const sym = c.symbol;
+          const arr = krakenCandles4h[sym] || (krakenCandles4h[sym] = []);
+          const lastC = arr[arr.length - 1];
+          if (lastC && Math.abs(lastC.c - c.close) / (c.close || 1) < 0.5) {
+            lastC.c = c.close; lastC.v = c.volume;
+          } else {
+            arr.push({ c: c.close, v: c.volume });
+            if (arr.length > 1000) arr.shift(); // 1000 bougies 4h = ~166 jours
+          }
+          // Scanner cette paire en 4h immÃ©diatement
+          setImmediate(() => scanSinglePair(sym, '4h'));
+        }
+      }
+    } catch (e) {}
+  });
+
+  ws4h.on('close', () => {
+    console.log('[WS-4h] DÃ©connectÃ© â€” reconnexion dans 5s');
+    setTimeout(() => connectKrakenWS4h(krakenPairsList), 5000);
+  });
+
+  ws4h.on('error', (err) => { console.log('[WS-4h] Erreur:', err.message); });
+}
+
 async function preloadHistoricalCandles(pairs) {
   console.log(`Preloading ${pairs.length} paires via REST (160 bougies Daily historiques)...`);
   const exchange = new ccxt.kraken({ enableRateLimit: true, timeout: 10000 });
@@ -357,6 +405,23 @@ async function preloadHistoricalCandles(pairs) {
     if (i + BATCH < pairs.length) await new Promise(r => setTimeout(r, 500));
   }
   console.log(`Preloading termine â€” ${loaded}/${pairs.length} paires chargees avec historique`);
+
+  // Preload 4h en parallÃ¨le
+  console.log('Preloading 4h...');
+  let loaded4h = 0;
+  for (let i = 0; i < pairs.length; i += BATCH) {
+    const batch = pairs.slice(i, i + BATCH);
+    await Promise.all(batch.map(async (symbol) => {
+      try {
+        const ohlcv = await exchange.fetchOHLCV(symbol, '4h', undefined, 1000);
+        if (!ohlcv || ohlcv.length < 10) return;
+        krakenCandles4h[symbol] = ohlcv.map(c => ({ c: c[4], v: c[6] || c[5] }));
+        loaded4h++;
+      } catch (e) {}
+    }));
+    if (i + BATCH < pairs.length) await new Promise(r => setTimeout(r, 300));
+  }
+  console.log(`Preloading 4h terminÃ© â€” ${loaded4h}/${pairs.length} paires`);
 }
 
 async function initKrakenWS() {
@@ -376,9 +441,10 @@ async function initKrakenWS() {
 const recentSignals = new Map(); // symbol â†’ timestamp dernier signal
 
 // Scan d'UNE seule paire â€” appelÃ© instantanÃ©ment sur chaque update WebSocket
-function scanSinglePair(symbol) {
+function scanSinglePair(symbol, timeframe = '1d') {
   try {
-    const candles = krakenCandles[symbol];
+    const candleStore = timeframe === '4h' ? krakenCandles4h : krakenCandles;
+    const candles = candleStore[symbol];
     if (!candles || candles.length < 100) return;
     const closes  = candles.map(c => c.c);
     const volumes = candles.map(c => c.v);
@@ -400,7 +466,7 @@ function scanSinglePair(symbol) {
       symbol,
       exchange:    'Kraken',
       exchangeId:  'kraken',
-      timeframe:   '1d',
+      timeframe,
       market:      'Spot',
       figure:      sig.fig.name,
       figureCode:  sig.fig.code,
@@ -473,8 +539,11 @@ async function executeTrade(signal) {
         const exchange = new ExClass({ apiKey: user.apiKey, secret: user.apiSecret, enableRateLimit: true });
         const balance = await exchange.fetchBalance();
         const usd = balance.USD?.free || 0;
-        const amount = Math.min(Math.max(user.tradeAmount || TRADE_AMOUNT, 5), 50);
-        if (usd < amount) { console.log(`[Bot] Solde insuffisant pour ${user.email}`); continue; }
+        const amount = Math.max(user.tradeAmount || TRADE_AMOUNT, 5); // montant libre, min 5
+        if (usd < amount) {
+          console.log(`[Bot] âš  Fonds insuffisants pour ${signal.symbol} (${usd.toFixed(2)} USD dispo, besoin ${amount} USD) â€” signal ignorÃ©, trop tard pour entrer`);
+          continue; // skip immÃ©diat â€” pas de retry
+        }
         const qty     = amount / signal.entryPrice;
         const tpPrice = signal.tp;
         const slPrice = signal.sl;
@@ -772,10 +841,12 @@ async function scanAll() {
         catch (e) { console.log(`[Bot] Erreur balance ${user.email}:`, e.message); continue; }
 
         const usd = balance.USD?.free || 0;
-        if (usd <= 0) { console.log(`[Bot] Aucun fonds USD pour ${user.email}`); continue; }
-
-        const rawAmount  = user.tradeAmount || TRADE_AMOUNT;
-        const amount     = Math.min(Math.max(rawAmount, 5), 50);
+        const rawAmount = user.tradeAmount || TRADE_AMOUNT;
+        const amount    = Math.max(rawAmount, 5);
+        if (usd < amount) {
+          console.log(`[Bot] âš  Fonds insuffisants (${usd.toFixed(2)} USD) â€” tous les signaux ignorÃ©s pour ${user.email}`);
+          continue; // skip immÃ©diat
+        }
         let ordersPlaced = 0;
 
         for (const sig of userSignals.slice(0, MAX_CONCURRENT)) {
@@ -1133,8 +1204,9 @@ app.listen(PORT, () => {
       connectKrakenTicker(krakenPairsList);
       console.log(' Ticker WebSocket connectÃ© â€” prix live actifs');
 
-      // â”€â”€ Ã‰TAPE 4: Connecter le WebSocket OHLC IMMÃ‰DIATEMENT (signaux)
+      // â”€â”€ Ã‰TAPE 4: Connecter les WebSocket OHLC IMMÃ‰DIATEMENT (Daily + 4h)
       connectKrakenWS(krakenPairsList);
+      connectKrakenWS4h(krakenPairsList); // 4h en parallÃ¨le
 
       // â”€â”€ Ã‰TAPE 5: Preloading en arriÃ¨re-plan (sans bloquer)
       preloadHistoricalCandles(krakenPairsList).then(() => {
